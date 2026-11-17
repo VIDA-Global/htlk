@@ -14,6 +14,12 @@ relabeling or deletion. There is no automatic migration or legacy binding decode
 Matching `0.1` format labels do not permit changed interpretation of saved effects.
 File stores require WAL, synchronous FULL, foreign keys, and bounded busy timeout.
 
+Opening a valid current-format SQLite store also ensures a nonunique partial
+lookup index for artifact tombstones. Expiration checks can seek by artifact ID
+without scanning unrelated execution history. Creating or rebuilding this derived
+index does not rewrite accepted records, journals, run authority or the schema
+version. It remains nonunique so native validation can detect duplicate tombstones.
+
 A private dedicated thread owns each SQLite connection. Cloned store handles share
 its FIFO operation queue. Dropping a caller future does not cancel queued storage
 work; explicit close drains earlier operations and closes all clones. Independent
