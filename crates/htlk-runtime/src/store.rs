@@ -171,6 +171,9 @@ impl Store {
                 } else if application != APPLICATION_ID || version != SCHEMA_VERSION {
                     return Err(StoreError::Schema);
                 }
+                // Rebuildable lookup metadata, including for an existing current-format store.
+                // Keep this nonunique: duplicate tombstones must still fail corruption checks.
+                tx.execute_batch("CREATE INDEX IF NOT EXISTS artifact_tombstone_lookup ON records(record_id) WHERE family='tombstone'")?;
                 tx.commit()?;
                 if !memory {
                     db.pragma_update(None, "journal_mode", "WAL")?;
@@ -645,6 +648,61 @@ mod tests {
             causation: "start-request".into(),
             timestamp_ms: 0,
         }
+    }
+    #[actix::test]
+    async fn tombstone_lookup_is_indexed_in_new_and_existing_stores() {
+        async fn assert_indexed(store: &SqliteStore) {
+            let details = store.connection.call(|db| -> Result<Vec<String>, StoreError> {
+                let mut statement = db.prepare("EXPLAIN QUERY PLAN SELECT final,payload FROM records WHERE family='tombstone' AND record_id=?1")?;
+                let rows = statement.query_map(["absent-fixture-artifact"], |row| row.get(3))?;
+                Ok(rows.collect::<Result<Vec<String>, _>>()?)
+            }).await.unwrap();
+            assert!(
+                details
+                    .iter()
+                    .any(|detail| detail.contains("SEARCH records")),
+                "expiration checks must seek rather than scan all execution history: {details:?}"
+            );
+        }
+        let directory = TempDb::new();
+        let store = SqliteStore::open(directory.path(), StoreConfig::default())
+            .await
+            .unwrap();
+        store.create_run(seed("index-fixture")).await.unwrap();
+        let before = counts(&store).await;
+        assert_indexed(&store).await;
+        store
+            .connection
+            .call(|db| -> Result<(), StoreError> {
+                let mut statement = db.prepare("PRAGMA index_list(records)")?;
+                let indexes = statement.query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, bool>(2)?))
+                })?;
+                let indexes = indexes.collect::<Result<Vec<_>, _>>()?;
+                assert!(
+                    indexes
+                        .iter()
+                        .any(|(name, unique)| name == "artifact_tombstone_lookup" && !unique),
+                    "duplicate tombstones must remain visible to native corruption checks"
+                );
+                db.execute_batch("DROP INDEX artifact_tombstone_lookup")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.close().await.unwrap();
+
+        // Existing current-format data also needs the derived lookup metadata.
+        let reopened = SqliteStore::open(directory.path(), StoreConfig::default())
+            .await
+            .unwrap();
+        assert_indexed(&reopened).await;
+        assert_eq!(
+            counts(&reopened).await,
+            before,
+            "index maintenance must not rewrite runs, journals or outbox evidence"
+        );
+        reopened.close().await.unwrap();
     }
     async fn counts(store: &SqliteStore) -> (i64, i64, i64) {
         store

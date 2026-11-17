@@ -23,6 +23,10 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ### Fixed
 
+- Index SQLite artifact-expiration tombstone lookups in fresh and existing
+  current-format stores, avoiding full-table scans during artifact validation and
+  recovery while preserving duplicate-tombstone corruption checks. Native
+  implementation identities and executable fingerprints change.
 - PostgreSQL COMMIT warnings, including cancellation of a synchronous replication
   wait, return `StoreError::CommitUnknown` and invalidate the connection instead of
   issuing an ordinary success receipt. Initialization/opening use the same guarded
