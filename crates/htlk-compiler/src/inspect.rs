@@ -166,12 +166,7 @@ impl Compiler {
             .iter()
             .cloned()
             .map(|mut d| {
-                d.location = session.source_location(&d.location);
-                d.related_locations = d
-                    .related_locations
-                    .iter()
-                    .map(|l| session.source_location(l))
-                    .collect();
+                session.remap_diagnostic(&mut d);
                 d
             })
             .collect::<Vec<_>>();

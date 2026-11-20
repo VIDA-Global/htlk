@@ -5,7 +5,7 @@ This pass starts at `a1b34ff`, after the [first cleanup](../README.md) and
 Each checked item has its verification results in the linked record.
 
 1. [x] [Establish the baseline](00-baseline.md)
-2. [ ] [Consolidate compiler diagnostic location mapping](01-compiler-diagnostic-locations.md)
+2. [x] [Consolidate compiler diagnostic location mapping](01-compiler-diagnostic-locations.md)
 3. [ ] [Cover stdio discovery classifications](02-stdio-discovery-classification.md)
 4. [ ] [Run SQLite-only tests in CI](03-sqlite-only-ci.md)
 5. [ ] [Verify the completed cleanup](04-final-verification.md)
