@@ -180,13 +180,22 @@ impl SqliteStore {
         lease: &RunLease,
         transition: Transition,
     ) -> Result<CommitReceipt, StoreError> {
+        self.commit_at_sequence(lease, transition, None).await
+    }
+
+    pub(crate) async fn commit_at_sequence(
+        &self,
+        lease: &RunLease,
+        transition: Transition,
+        sequence: Option<i64>,
+    ) -> Result<CommitReceipt, StoreError> {
         let limits = self.config.limits.clone();
         let prepared = PreparedTransition::new(lease, transition, &limits)?;
         let lease = lease.clone();
         self.connection
             .call(move |db| -> Result<CommitReceipt, StoreError> {
                 let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let receipt = prepared.apply(&tx, &lease, &limits)?;
+                let receipt = prepared.apply_at_sequence(&tx, &lease, &limits, sequence)?;
                 tx.commit()?;
                 Ok(receipt)
             })
@@ -427,6 +436,16 @@ impl PreparedTransition {
         lease: &RunLease,
         limits: &Limits,
     ) -> Result<CommitReceipt, StoreError> {
+        self.apply_at_sequence(tx, lease, limits, None)
+    }
+
+    fn apply_at_sequence(
+        self,
+        tx: &rusqlite::Transaction<'_>,
+        lease: &RunLease,
+        limits: &Limits,
+        sequence: Option<i64>,
+    ) -> Result<CommitReceipt, StoreError> {
         let Self {
             transition,
             request_digest,
@@ -436,6 +455,9 @@ impl PreparedTransition {
         let header = load_header(tx, &lease.run_id)?;
         let now = transition.context.timestamp_ms.max(header.last_time_ms);
         check_authority(&header, lease, now)?;
+        if sequence.is_some_and(|expected| header.sequence != expected) {
+            return Err(StoreError::Conflict);
+        }
         let old = tx
             .query_row(
                 "SELECT request_digest,sequence FROM commands WHERE run_id=?1 AND command_id=?2",

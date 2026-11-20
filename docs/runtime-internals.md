@@ -329,6 +329,15 @@ Failures and absent results retain influence as well as values.
 
 ## Recovery and concurrent progress
 
+Each active coordinator keeps a bounded scheduling working set. One worker pass
+advances one decision before returning to the mailbox. Matching journal sequence
+permits reuse of scope, invocation and already recorded guard metadata; successful
+successor commits update the local records, and sequence gaps drop the working set.
+An observed pending unconditional dependency can defer that admission until the
+producer changes. Conditional guards and selected artifact values still use the
+ordinary reducer and current access policy. The store rechecks the observed
+sequence for commits based on that working set, alongside normal fence and CAS checks.
+
 Recovery re-admits all exact origins and checks definition/use IDs, complete frozen
 manifests, artifacts, waits, attempts, normalization observations, and adopted
 reservations. Saved responses resume local validation; uncertain unsafe sends fail

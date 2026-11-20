@@ -21,6 +21,7 @@ pub use inspection::{
     WaitView,
 };
 mod waits;
+mod working;
 pub use host::{CancelReceipt, ReplyReceipt};
 pub use waits::WaitPolicy;
 mod frame;
@@ -172,17 +173,28 @@ struct Work {
     runtime: Arc<Runtime>,
     lease: RunLease,
     recovering: bool,
+    working: working::Slot,
 }
 impl Message for Work {
-    type Result = Result<step::Progress, RuntimeError>;
+    type Result = (Result<step::Progress, RuntimeError>, working::Slot);
 }
 impl Handler<Work> for Worker {
-    type Result = Result<step::Progress, RuntimeError>;
+    type Result = MessageResult<Work>;
     fn handle(&mut self, msg: Work, _: &mut Self::Context) -> Self::Result {
         if msg.stop.is_cancelled() {
-            return Ok(step::Progress::Blocked);
+            return MessageResult((Ok(step::Progress::Blocked), None));
         }
-        System::new().block_on(recovery::drive(msg.runtime, msg.lease, msg.recovering))
+        let cell = std::cell::RefCell::new(msg.working);
+        let mut run = Box::pin(working::WORKING.scope(
+            cell,
+            recovery::drive(msg.runtime, msg.lease, msg.recovering),
+        ));
+        let result = System::new().block_on(run.as_mut());
+        let cache = run
+            .as_mut()
+            .take_value()
+            .and_then(std::cell::RefCell::into_inner);
+        MessageResult((result, cache))
     }
 }
 pub(crate) struct Supervisor {
@@ -345,6 +357,7 @@ impl Handler<Poll> for Supervisor {
                             initial_time: now,
                             renew_after: now.saturating_add(actor.config.lease_ms / 3),
                             checking: false,
+                            working: Some(working::WorkingSet::default()),
                         }
                         .start();
                         actor.active.insert(run, address);
@@ -382,6 +395,7 @@ struct Coordinator {
     initial_time: i64,
     renew_after: i64,
     checking: bool,
+    working: working::Slot,
 }
 enum CoordinationState {
     Acquiring,
@@ -511,10 +525,15 @@ impl Handler<Pulse> for Coordinator {
                     runtime: self.runtime.clone(),
                     lease,
                     recovering: !self.state.is_recovered(),
+                    working: self.working.take(),
                 })
                 .into_actor(self)
                 .map(|result, actor, ctx| {
                     actor.busy = false;
+                    let result = result.map(|(result, working)| {
+                        actor.working = working;
+                        result
+                    });
                     match result {
                         Ok(Ok(step::Progress::Changed)) => {
                             actor.state.mark_recovered();

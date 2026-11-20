@@ -14,6 +14,7 @@ impl SqliteStore {
         &self,
         run: &RunId,
         observed: i64,
+        cached_sequence: Option<i64>,
     ) -> Result<SchedulingPage, StoreError> {
         let run = run.clone();
         let config = self.config.clone();
@@ -25,14 +26,18 @@ impl SqliteStore {
                     (header.last_time_ms, Vec::new())
                 } else {
                     let now = runs::observed_time(&tx, observed)?;
-                    let scopes = record_page(
-                        &tx,
-                        &run,
-                        RecordFamily::Scope,
-                        None,
-                        config.max_page_size,
-                        &config.limits,
-                    )?;
+                    let scopes = if cached_sequence == Some(header.sequence) {
+                        Vec::new()
+                    } else {
+                        record_page(
+                            &tx,
+                            &run,
+                            RecordFamily::Scope,
+                            None,
+                            config.max_page_size,
+                            &config.limits,
+                        )?
+                    };
                     (now, scopes)
                 };
                 tx.commit()?;
@@ -307,10 +312,10 @@ mod tests {
             db.execute("INSERT INTO runs(run_id,fingerprint,root_scope,status,sequence,fence,last_time_ms) VALUES('schedule',?1,?2,'running',1,0,10)", params![Digest::from_bytes([1; 32]).to_string(), root])?;
             Ok(())
         }).await.unwrap();
-        let first = store.scheduling_page(&run, 100).await.unwrap();
+        let first = store.scheduling_page(&run, 100, None).await.unwrap();
         assert_eq!(first.now, 100);
         assert_eq!(first.header.sequence, 1);
-        let second = store.scheduling_page(&run, 5).await.unwrap();
+        let second = store.scheduling_page(&run, 5, None).await.unwrap();
         assert_eq!(second.now, 10);
     }
 

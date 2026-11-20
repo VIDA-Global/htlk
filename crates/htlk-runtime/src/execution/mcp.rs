@@ -715,6 +715,10 @@ async fn operate_inner(
             None,
         )
         .await?;
+        // A host command or callback can advance the run while this send is in
+        // flight. Persist the response against its own authoritative attempt, not
+        // the scheduling snapshot that preceded dispatch.
+        super::working::with(|set| set.reset(0));
         let timeout = effective.attempt_timeout_ms().ok_or_else(err)?.min(
             u64::try_from(number(&record.payload, "deadline_ms")?.saturating_sub(now))
                 .unwrap_or(1)

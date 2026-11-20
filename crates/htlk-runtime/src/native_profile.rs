@@ -65,6 +65,7 @@ pub fn native_profile(
         include_bytes!("execution/checkpoint.rs"),
         include_bytes!("execution/frame.rs"),
         include_bytes!("execution/step.rs"),
+        include_bytes!("execution/working.rs"),
         include_bytes!("execution/composite.rs"),
         include_bytes!("execution/control.rs"),
         include_bytes!("execution/waits.rs"),

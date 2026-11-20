@@ -13,6 +13,9 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ### Changed
 
+- Active coordinators reuse a bounded committed working set on both backends.
+  Successive decisions refresh changed checkpoint metadata, defer known pending
+  unconditional dependencies, and recheck the observed journal sequence at commit.
 - The SQLite layout uses indexed artifact-expiry and running-run lookups (schema
   15). Both backends read the first scheduling page with the header and advisory
   clock in one storage operation. Native implementation identities change.
