@@ -54,6 +54,12 @@ wait or artifact IDs when routing by those IDs alone. `positions()` returns one
 history pin per store for paged reads, without a global commit order or a
 transaction spanning partitions.
 
+Set `ExecutionConfig::pure_batch_steps` to 2–8 to combine the guard, admission,
+and result decisions of an `eval` invocation into bounded commits. The default
+is 1. Each logical decision remains in the journal; inspection pins represent
+the final state of each physical commit. Consumers that need to pin individual
+intermediate `eval` states should leave batching disabled.
+
 SQLite is enabled by default. `SqliteStore` is the compatible name for the shared
 store handle's `open`/`in_memory` constructors. To enable PostgreSQL through the
 facade, select its Cargo feature:

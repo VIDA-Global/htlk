@@ -166,6 +166,71 @@ pub struct OutboxNotice {
 }
 
 impl SqliteStore {
+    pub(crate) async fn commit_pure_batch(
+        &self,
+        lease: &RunLease,
+        sequence: i64,
+        observed: i64,
+        deadline: i64,
+        steps: Vec<Transition>,
+        blobs: Vec<crate::artifact::PreparedArtifact>,
+    ) -> Result<i64, StoreError> {
+        if !(1..=8).contains(&steps.len())
+            || steps
+                .iter()
+                .any(|step| step.next_status.is_some() || step.root.is_some())
+        {
+            return Err(StoreError::Invalid);
+        }
+        let limits = self.config.limits.clone();
+        let prepared: Vec<_> = steps
+            .into_iter()
+            .map(|step| PreparedTransition::new(lease, step, &limits))
+            .collect::<Result<_, _>>()?;
+        for blob in &blobs {
+            blob.metadata()
+                .verify_value(blob.bytes(), &limits)
+                .map_err(artifacts::artifact_error)?;
+        }
+        let lease = lease.clone();
+        self.connection
+            .write_run(lease.run_id().to_string(), move |db| {
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let header = load_header(&tx, lease.run_id())?;
+                let now = runs::observed_time(&tx, observed)?;
+                check_authority(&header, &lease, now)?;
+                if header.sequence != sequence || header.status.is_terminal() {
+                    return Err(StoreError::Conflict);
+                }
+                if now >= deadline {
+                    return Err(StoreError::Deadline(FailureCode::Timeout));
+                }
+                for blob in blobs {
+                    artifacts::stage_bytes(&tx, blob.metadata().storage_reference(), blob.bytes())?;
+                }
+                let mut sequence = sequence;
+                for mut transition in prepared {
+                    transition.transition.context.timestamp_ms =
+                        now.max(transition.transition.context.timestamp_ms);
+                    let next = sequence.checked_add(1).ok_or(StoreError::Invalid)?;
+                    let receipt = transition.apply_at_sequence(
+                        &tx,
+                        &lease,
+                        &limits,
+                        Some(sequence),
+                        false,
+                    )?;
+                    if receipt.sequence != next {
+                        return Err(StoreError::Conflict);
+                    }
+                    sequence = next;
+                }
+                tx.commit()?;
+                Ok(sequence)
+            })
+            .await
+            .map_err(StoreError::from_worker)
+    }
     /// Atomically compare/revise records, update run status/root, append the complete
     /// decision and enqueue its outbox hint. An identical command returns its old
     /// receipt; a changed request under that key fails. Timestamp and worker lease

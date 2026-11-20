@@ -23,20 +23,7 @@ impl SqliteStore {
         self.connection
             .call(move |db| -> Result<Digest, StoreError> {
                 let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let old = tx
-                    .query_row(
-                        "SELECT value_bytes=?2 FROM value_blobs WHERE blob_digest=?1",
-                        params![reference.to_string(), bytes],
-                        |r| r.get::<_, bool>(0),
-                    )
-                    .optional()?;
-                if old == Some(false) {
-                    return Err(StoreError::Corrupt);
-                }
-                tx.execute(
-                    "INSERT OR IGNORE INTO value_blobs(blob_digest,value_bytes) VALUES(?1,?2)",
-                    params![reference.to_string(), bytes],
-                )?;
+                stage_bytes(&tx, reference, &bytes)?;
                 tx.commit()?;
                 Ok(reference)
             })
@@ -134,6 +121,29 @@ impl SqliteStore {
             .await
             .map_err(StoreError::from_worker)
     }
+}
+
+pub(super) fn stage_bytes(
+    tx: &rusqlite::Transaction<'_>,
+    reference: Digest,
+    bytes: &[u8],
+) -> Result<(), StoreError> {
+    let reference = reference.to_string();
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO value_blobs(blob_digest,value_bytes) VALUES(?1,?2)",
+        params![reference, bytes],
+    )?;
+    if inserted == 0 {
+        let exact = tx.query_row(
+            "SELECT value_bytes=?2 FROM value_blobs WHERE blob_digest=?1",
+            params![reference, bytes],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exact {
+            return Err(StoreError::Corrupt);
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn check_artifact_write(
@@ -348,7 +358,7 @@ pub(super) fn check_output_publication(
     Ok(())
 }
 
-fn artifact_error(error: ArtifactError) -> StoreError {
+pub(super) fn artifact_error(error: ArtifactError) -> StoreError {
     match error {
         ArtifactError::Limit => StoreError::Invalid,
         ArtifactError::Codec(error)
