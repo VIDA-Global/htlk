@@ -9,7 +9,15 @@ use htlk::runtime::{
     records::{InputValue, RunStatus},
 };
 use htlk_executable::cbor::*;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Mutex};
+
+fn campaign() -> std::sync::MutexGuard<'static, ()> {
+    // Independent campaigns each launch their own workers, stores and peers.
+    // Do not turn runner contention between campaigns into an input to the
+    // protocol or deadline assertions. Worker concurrency inside each is real.
+    static CAMPAIGN: Mutex<()> = Mutex::new(());
+    CAMPAIGN.lock().unwrap_or_else(|error| error.into_inner())
+}
 
 const ALL_OPERATIONS: &str = r#"
 ir_version="0.1"
@@ -36,6 +44,7 @@ graph test.full_stack { inputs={value=union(string,null)}
 
 #[test]
 fn source_to_native_stdio_http_and_sse_preserves_values_artifacts_and_journals() {
+    let _campaign = campaign();
     actix::System::new().block_on(async {
         for transport in ["stdio", "http", "sse"] {
             let peer = Peer::new(transport, "success");
@@ -72,6 +81,7 @@ edges{edge args{from=args.outputs.value to=echo.inputs.arguments}edge value{from
 
 #[test]
 fn non_tool_protocol_failures_cannot_publish_or_impersonate_tool_inference_sources() {
+    let _campaign = campaign();
     actix::System::new().block_on(async {
         for transport in ["stdio", "http", "sse"] {
             let peer = Peer::new(transport, "bad-data");
@@ -124,6 +134,7 @@ fn non_tool_protocol_failures_cannot_publish_or_impersonate_tool_inference_sourc
 
 #[test]
 fn native_protocol_failures_have_durable_classifications_and_never_publish_outputs() {
+    let _campaign = campaign();
     actix::System::new().block_on(async {
         for transport in ["stdio", "http", "sse"] {
             for (mode, expected, sent) in [
@@ -164,7 +175,12 @@ fn native_protocol_failures_have_durable_classifications_and_never_publish_outpu
                     )
                     .await
                     .unwrap();
-                assert_eq!(node.failure.unwrap().code(), expected, "{transport}/{mode}");
+                assert_eq!(
+                    node.failure.as_ref().map(|failure| failure.code()),
+                    Some(expected),
+                    "{transport}/{mode}; node: {node:#?}; peer requests: {:#?}",
+                    peer.requests()
+                );
                 if mode == "rpc-error" {
                     let invocation = htlk::runtime::identity::InvocationId::new(
                         view.header.root_scope,
@@ -210,6 +226,7 @@ fn native_protocol_failures_have_durable_classifications_and_never_publish_outpu
 
 #[test]
 fn generated_branch_graphs_match_an_independent_oracle_across_worker_counts() {
+    let _campaign = campaign();
     actix::System::new().block_on(async {
         for workers in [1,2,4] {
             let h = Harness::new(None,workers).await;
@@ -236,6 +253,7 @@ fn standalone_and_modular_decision_briefs_execute_through_native_http_and_sse() 
         runtime::mcp::{McpEndpoint, NativeMcpAdapter},
     };
     use std::sync::Arc;
+    let _campaign = campaign();
     actix::System::new().block_on(async {
         let catalogs = support::catalogs();
         let bundle = SourceBundle::from_json(
@@ -336,6 +354,7 @@ fn standalone_and_modular_decision_briefs_execute_through_native_http_and_sse() 
 #[test]
 fn repeated_public_port_joins_execute_the_preserved_operand_implementations() {
     use htlk::compiler::*;
+    let _campaign = campaign();
     actix::System::new().block_on(async {
         let h=Harness::new(None,3).await;
         let operand=h.compiler.compile_source(r#"ir_version="0.1"prompt decorate(value=string)="[{value}]"graph test.decorate{inputs={value=string}outputs={value=string}nodes{n=eval(string,render(&decorate,{value=inputs.value})){inputs={value=string}}}edges{edge input{from=inputs.value to=n.inputs.value}edge value{from=n.outputs.value to=outputs.value}}}"#,&support::catalogs()).unwrap();
@@ -409,6 +428,7 @@ fn native_dispatch_requires_authenticated_exact_action_approval_and_keeps_dispos
             Ok(SecurityLabels::new(vec!["review-protected".into()], &Limits::default()).unwrap())
         }
     }
+    let _campaign = campaign();
     actix::System::new().block_on(async {
         for transport in ["stdio", "http", "sse"] {
             for allow in [false, true] {
@@ -565,6 +585,7 @@ fn native_dispatch_requires_authenticated_exact_action_approval_and_keeps_dispos
 #[test]
 fn cancellation_reaches_live_native_requests_and_retains_ambiguous_accounting() {
     use std::time::{Duration, Instant};
+    let _campaign = campaign();
     actix::System::new().block_on(async {
         for transport in ["stdio","http","sse"]{
             let peer=Peer::new(transport,"hold");let h=Harness::new(Some(&peer),2).await;let graph=h.compiler.compile_source(TOOL,&catalogs(peer.transport)).unwrap();h.runtime.register_graph(&caller(),&graph.executable_bytes,&[]).await.unwrap();let run=h.runtime.start_run(&caller(),graph.fingerprint,&BTreeMap::new(),"cancel",None).await.unwrap();
