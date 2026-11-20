@@ -22,12 +22,16 @@ node tools/validate-docs.mjs
 node specs/validate-specs.mjs
 node tools/validate-executable-fixtures.mjs
 node --test tools/validate-docs.test.mjs tools/coverage.test.mjs tools/discover-mcp.test.mjs
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+bash tools/check-rust.sh
+cargo test --workspace --all-features --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
+cargo deny check
 cargo package --workspace --all-features --locked --target-dir "$(mktemp -d)"
 ```
+
+The shared Rust check script runs formatting, locked compilation and Clippy with
+warnings denied. It checks all targets with SQLite only, PostgreSQL only and both
+backends, and checks library-only embedding without a backend.
 
 Every public API should include rustdoc. Behavior changes should include tests
 and an entry under the `Unreleased` section of `CHANGELOG.md`.

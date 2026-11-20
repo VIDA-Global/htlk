@@ -10,3 +10,10 @@ strict Clippy to each compilation case. Fix any new lint at its source.
 
 **Verification.** Run the shared matrix, `actionlint`, and the documentation
 validator. Record results before starting compiler work.
+
+## Results
+
+PR and release validation now invoke `bash tools/check-rust.sh`, also listed in
+the contributor instructions. Formatting, locked compilation and strict Clippy
+passed for every case; no source lint fixes were needed. `bash -n`, `actionlint`,
+the documentation and specification validators, and `git diff --check` passed.
