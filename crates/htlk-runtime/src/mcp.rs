@@ -94,6 +94,50 @@ impl std::fmt::Debug for McpOutcome {
 /// A sendable delivery-aware attempt future.
 pub type McpAttemptFuture<'a> = Pin<Box<dyn Future<Output = McpOutcome> + Send + 'a>>;
 
+/// Exact original graph dispatch identity. A trusted adapter can persist these
+/// fields with the correlated outcome. They are assertions, not authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpGraphAttempt {
+    /// Persistent namespace of the original runtime store.
+    pub namespace: String,
+    /// Exact original run, node occurrence and attempt.
+    pub origin: client::McpOperationOrigin,
+    /// Executable that defines the original node, including after extension.
+    pub executable: htlk_executable::digest::Digest,
+    /// Exact compiled compound binding.
+    pub binding: htlk_executable::digest::Digest,
+    /// Digest of the original method, canonical parameters and dispatch key.
+    pub request_digest: htlk_executable::digest::Digest,
+    /// Fence under which dispatch was recorded, not a recovery lease.
+    pub dispatch_fence: i64,
+    /// Original exclusive absolute attempt deadline.
+    pub deadline_ms: i64,
+}
+
+/// Persisted outcome associated with a graph attempt by the trusted host.
+/// Recovery accepts correlated responses only, including correlated RPC errors.
+#[derive(Debug)]
+pub struct McpSavedGraphResponse {
+    /// Original attempt identity captured at graph dispatch.
+    pub attempt: McpGraphAttempt,
+    /// The original adapter outcome, with `ResponseReceived` delivery.
+    pub outcome: McpOutcome,
+    /// The original protected JSON-RPC error, if any.
+    pub protocol_error: Option<client::McpRpcError>,
+}
+
+/// Exact current-policy authorization input for accepting a host-saved response.
+pub struct McpGraphRecovery<'a> {
+    /// Verified original attempt identity.
+    pub attempt: &'a McpGraphAttempt,
+    /// Principal for whom the original graph was executing.
+    pub original_principal: &'a str,
+    /// Verified original compiled binding.
+    pub binding: &'a McpBinding,
+    /// Conservative protection of the request and response evidence.
+    pub labels: &'a SecurityLabels,
+}
+
 /// Opaque runtime-established origin of an admitted MCP attempt. The native client
 /// carries it alongside pending RPCs; server metadata cannot construct this grant.
 #[derive(Clone)]
@@ -102,6 +146,7 @@ pub struct McpAttemptContext {
     pub(crate) server: htlk_executable::digest::Digest,
     pub(crate) deadline_ms: i64,
     pub(crate) labels: SecurityLabels,
+    pub(crate) graph_attempt: Option<Arc<McpGraphAttempt>>,
 }
 impl McpAttemptContext {
     /// Actual originating run, invocation and attempt.
@@ -111,6 +156,11 @@ impl McpAttemptContext {
     /// Maximum inherited absolute deadline.
     pub fn deadline_ms(&self) -> i64 {
         self.deadline_ms
+    }
+    /// Returns the identity to save with an original graph response. Nested
+    /// client work does not confer this graph-response identity.
+    pub fn graph_attempt(&self) -> Option<&McpGraphAttempt> {
+        self.graph_attempt.as_deref()
     }
 }
 

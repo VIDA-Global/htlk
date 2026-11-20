@@ -290,7 +290,11 @@ bounded result-capacity reservations remain quota-counted tombstones after expir
 eviction cannot authorize duplicate work. Remote identities persist for protected
 inspection, but recovery does not dispatch, recreate work, or silently adopt a new epoch.
 Explicit cross-epoch remote-task adoption/reconciliation remains a host integration
-responsibility; no automatic graph task recovery is claimed.
+responsibility; no automatic graph task recovery is claimed. An authorized host
+may submit a correlated final outcome it already durably saved for an eligible
+graph attempt under a current successor fence, as defined in the
+[runtime specification](runtime-spec.md). Task acceptance or a task ID alone is
+not a final outcome and cannot be submitted as a response.
 
 ## Native URL elicitation lifecycle
 

@@ -674,6 +674,26 @@ async fn operate_inner(
                 return Ok(true);
             }
         };
+        let node_deadline = number(&record.payload, "deadline_ms")?;
+        let timeout = effective.attempt_timeout_ms().ok_or_else(err)?.min(
+            u64::try_from(node_deadline.saturating_sub(now))
+                .unwrap_or(1)
+                .max(1),
+        );
+        let dispatch_deadline = node_deadline.min(now.saturating_add(timeout as i64));
+        let graph_attempt = super::mcp_recovery::attempt_reference(
+            crate::mcp::client::McpOperationOrigin {
+                run_id: lease.run_id().clone(),
+                invocation_id: invocation,
+                attempt_id: attempt_id.parse().map_err(|_| err())?,
+            },
+            scope.executable.fingerprint(),
+            *binding_id,
+            lease.fence(),
+            dispatch_deadline,
+            &attempt.payload,
+            &runtime.config.limits,
+        )?;
         usage.push(update(
             &attempt,
             replace(
@@ -681,6 +701,7 @@ async fn operate_inner(
                 [
                     ("dispatch_state", Value::Text("possibly_sent".into())),
                     ("owner_fence", Value::Integer(lease.fence())),
+                    ("dispatch_deadline_ms", Value::Integer(dispatch_deadline)),
                     ("policy_version", Value::Text(policy.policy_version.clone())),
                     ("replay_authorized", Value::Bool(policy.replay_safe)),
                     (
@@ -719,11 +740,6 @@ async fn operate_inner(
         // flight. Persist the response against its own authoritative attempt, not
         // the scheduling snapshot that preceded dispatch.
         super::working::with(|set| set.reset(0));
-        let timeout = effective.attempt_timeout_ms().ok_or_else(err)?.min(
-            u64::try_from(number(&record.payload, "deadline_ms")?.saturating_sub(now))
-                .unwrap_or(1)
-                .max(1),
-        );
         let outcome = match bounded(
             &cancellation.token,
             timeout,
@@ -740,18 +756,14 @@ async fn operate_inner(
                     idempotency_key: protocol_key,
                 },
                 crate::mcp::McpAttemptContext {
-                    origin: crate::mcp::client::McpOperationOrigin {
-                        run_id: lease.run_id().clone(),
-                        invocation_id: invocation,
-                        attempt_id: attempt_id.parse().map_err(|_| err())?,
-                    },
+                    origin: graph_attempt.origin.clone(),
                     server: binding
                         .server()
                         .digest(&runtime.config.limits)
                         .map_err(|_| err())?,
-                    deadline_ms: number(&record.payload, "deadline_ms")?
-                        .min(now.saturating_add(timeout as i64)),
+                    deadline_ms: dispatch_deadline,
                     labels: influence.union(&policy.result_labels, &runtime.config.limits)?,
+                    graph_attempt: Some(Arc::new(graph_attempt)),
                 },
             ),
         )
@@ -783,7 +795,7 @@ async fn operate_inner(
     .await;
     result
 }
-fn response_limit(runtime: &Runtime) -> usize {
+pub(super) fn response_limit(runtime: &Runtime) -> usize {
     runtime
         .config
         .limits
@@ -818,12 +830,63 @@ async fn record_outcome(
     runtime: &Runtime,
     lease: &RunLease,
     attempt: &StoredRecord,
-    mut outcome: McpOutcome,
+    outcome: McpOutcome,
     protocol_error: Option<crate::mcp::client::McpRpcError>,
     policy: &McpPolicy,
     influence: crate::records::SecurityLabels,
 ) -> Result<bool, RuntimeError> {
     let attempt_id = &attempt.key.id;
+    let response = response_payload(runtime, outcome, protocol_error, policy.replay_safe)?;
+    let client_labels = runtime
+        .store
+        .run_client_metadata(
+            lease.run_id(),
+            None,
+            Some(attempt_id.parse().map_err(|_| err())?),
+        )
+        .await?
+        .1;
+    let response_labels = influence
+        .union(&policy.result_labels, &runtime.config.limits)?
+        .union(&client_labels, &runtime.config.limits)?;
+    let response = replace(
+        &response,
+        [(
+            "influence_labels",
+            response_labels.to_value(&runtime.config.limits)?,
+        )],
+    )?;
+    let current = runtime.store.record(lease.run_id(), &attempt.key).await?;
+    let writes = response_writes(&current, response.clone(), false)?;
+    match step::commit(
+        runtime,
+        lease,
+        format!("response:{attempt_id}"),
+        writes,
+        None,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(RuntimeError::Storage(
+            crate::store::StoreError::Terminal | crate::store::StoreError::Fenced,
+        )) => {
+            runtime
+                .store
+                .save_late_response(lease.run_id(), attempt_id, &response, &response_labels)
+                .await?;
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(true)
+}
+
+pub(super) fn response_payload(
+    runtime: &Runtime,
+    mut outcome: McpOutcome,
+    protocol_error: Option<crate::mcp::client::McpRpcError>,
+    replay_safe: bool,
+) -> Result<Value, RuntimeError> {
     let delivery = outcome.delivery;
     let protocol_error = protocol_error.filter(|error| {
         let valid = delivery == McpDelivery::ResponseReceived
@@ -854,7 +917,7 @@ async fn record_outcome(
             (
                 "failure_code",
                 Value::Text(
-                    if delivery == McpDelivery::PossiblySent && !policy.replay_safe {
+                    if delivery == McpDelivery::PossiblySent && !replay_safe {
                         FailureCode::EffectUncertain
                     } else {
                         FailureCode::McpProtocol
@@ -868,7 +931,7 @@ async fn record_outcome(
             ),
         ])?,
         Err(error) => {
-            let code = if delivery == McpDelivery::PossiblySent && !policy.replay_safe {
+            let code = if delivery == McpDelivery::PossiblySent && !replay_safe {
                 FailureCode::EffectUncertain
             } else {
                 error.code()
@@ -896,61 +959,28 @@ async fn record_outcome(
     } else {
         response
     };
-    let client_labels = runtime
-        .store
-        .run_client_metadata(
-            lease.run_id(),
-            None,
-            Some(attempt_id.parse().map_err(|_| err())?),
-        )
-        .await?
-        .1;
-    let response_labels = influence
-        .union(&policy.result_labels, &runtime.config.limits)?
-        .union(&client_labels, &runtime.config.limits)?;
-    let response = replace(
+    replace(
         &response,
-        [
-            (
-                "influence_labels",
-                response_labels.to_value(&runtime.config.limits)?,
-            ),
-            ("delivery", Value::Text(delivery.as_str().into())),
-        ],
-    )?;
-    let current = runtime.store.record(lease.run_id(), &attempt.key).await?;
-    let writes = vec![
-        update(
-            &current,
-            replace(
-                &current.payload,
-                [("dispatch_state", Value::Text("response_recorded".into()))],
-            )?,
-            true,
-        ),
-        insert(RecordFamily::Response, attempt_id, response.clone(), true),
-    ];
-    match step::commit(
-        runtime,
-        lease,
-        format!("response:{attempt_id}"),
-        writes,
-        None,
+        [("delivery", Value::Text(delivery.as_str().into()))],
     )
-    .await
-    {
-        Ok(()) => {}
-        Err(RuntimeError::Storage(
-            crate::store::StoreError::Terminal | crate::store::StoreError::Fenced,
-        )) => {
-            runtime
-                .store
-                .save_late_response(lease.run_id(), attempt_id, &response, &response_labels)
-                .await?;
-        }
-        Err(error) => return Err(error),
+}
+
+pub(super) fn response_writes(
+    attempt: &StoredRecord,
+    response: Value,
+    recovered: bool,
+) -> Result<Vec<crate::store::RecordWrite>, RuntimeError> {
+    let mut payload = replace(
+        &attempt.payload,
+        [("dispatch_state", Value::Text("response_recorded".into()))],
+    )?;
+    if recovered {
+        payload = replace(&payload, [("host_recovered", Value::Bool(true))])?;
     }
-    Ok(true)
+    Ok(vec![
+        update(attempt, payload, true),
+        insert(RecordFamily::Response, &attempt.key.id, response, true),
+    ])
 }
 fn deduplication(
     runtime: &Runtime,
@@ -1022,7 +1052,7 @@ pub(super) fn protocol_error<'a>(
     crate::mcp::client::McpRpcError::new(document).map_err(|_| invalid())?;
     Ok(Some(raw))
 }
-async fn request(
+pub(super) async fn request(
     runtime: &Runtime,
     scope: &ScopeState,
     binding: &McpBinding,
@@ -1069,7 +1099,7 @@ pub(super) fn encode_request(
         }
     })
 }
-async fn normalize(
+pub(super) async fn normalize(
     runtime: &Runtime,
     scope: &ScopeState,
     binding: &McpBinding,
@@ -1162,7 +1192,10 @@ async fn normalize(
         }
     }
 }
-fn require_result_policy(binding: &McpBinding, policy: &McpPolicy) -> Result<(), RuntimeError> {
+pub(super) fn require_result_policy(
+    binding: &McpBinding,
+    policy: &McpPolicy,
+) -> Result<(), RuntimeError> {
     if binding
         .result_policy()
         .is_some_and(|expected| expected != &policy.result_policy)
@@ -1198,7 +1231,11 @@ async fn fail_attempt(
         return Err(err());
     };
     let attempt_number = u64::try_from(number(&attempt.payload, "number")?).map_err(|_| err())?;
-    let delay = super::retry::replay_delay(retry, attempt_number, code, policy.replay_safe)?;
+    let delay = if map(&attempt.payload)?.get("host_recovered") == Some(&Value::Bool(true)) {
+        None
+    } else {
+        super::retry::replay_delay(retry, attempt_number, code, policy.replay_safe)?
+    };
     let decision = |disposition: &str| -> Result<crate::store::RecordWrite, RuntimeError> {
         Ok(insert(
             RecordFamily::Observation,

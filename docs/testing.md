@@ -410,6 +410,12 @@ uncommitted writer, and check physical PostgreSQL commits across domain savepoin
 Two feed consumers and outbox acknowledgment exercise independent resume positions.
 These are read-only history tests, not execution replay or provider qualification.
 
+`cargo test -p htlk --all-features --locked --test runtime_upstream_postgres`
+checks host absolute admission under advisory lock contention and real COMMIT
+acknowledgment loss. It also kills a graph worker after the host commits the
+correlated reply but before the native response checkpoint, then checks successor
+recovery, exact output and provider-call count, and late/rejected evidence.
+
 ## Native identity and fixtures
 
 Native implementation identities hash explicit source contributions, package-owned

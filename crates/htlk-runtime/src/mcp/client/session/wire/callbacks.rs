@@ -93,6 +93,7 @@ impl Wire {
                     .expect("validated identity"),
                 deadline_ms: related.deadline_ms,
                 labels: related.labels.clone(),
+                graph_attempt: None,
             });
         }
         let token = Arc::new(token);
