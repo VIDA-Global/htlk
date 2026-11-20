@@ -331,6 +331,22 @@ fn standalone_and_modular_decision_briefs_execute_through_native_http_and_sse() 
                     let Value::Map(result) = output(&h.runtime, &view, "result").await else {
                         panic!()
                     };
+                    let case =
+                        format!("transport={transport}, accept_at={accept_at}, modular={modular}");
+                    let refine = h
+                        .runtime
+                        .inspect_node(
+                            &caller(),
+                            &view.header.run_id,
+                            htlk::runtime::identity::InvocationId::new(
+                                view.header.root_scope,
+                                &"refine".parse().unwrap(),
+                                &Limits::default(),
+                            )
+                            .unwrap(),
+                        )
+                        .await
+                        .unwrap();
                     assert_eq!(
                         result.get("status"),
                         Some(&Value::Text(
@@ -340,9 +356,31 @@ fn standalone_and_modular_decision_briefs_execute_through_native_http_and_sse() 
                                 "needs_attention"
                             }
                             .into()
-                        ))
+                        )),
+                        "{case}; refinement: {refine:#?}; scopes: {:#?}; peer requests: {:#?}",
+                        view.scopes,
+                        peer.requests()
                     );
-                    assert_eq!(peer.calls().len(), 2 + 2 * accept_at.min(3));
+                    assert_eq!(peer.calls().len(), 2 + 2 * accept_at.min(3), "{case}");
+                    let improve = h
+                        .runtime
+                        .inspect_node(
+                            &caller(),
+                            &view.header.run_id,
+                            htlk::runtime::identity::InvocationId::new(
+                                refine.child_scope.expect("refinement opened a task scope"),
+                                &"improve".parse().unwrap(),
+                                &Limits::default(),
+                            )
+                            .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        improve.failure.as_ref().map(|failure| failure.code()),
+                        (accept_at > 3).then_some(FailureCode::LoopLimit),
+                        "{case}; loop: {improve:#?}"
+                    );
                     assert_replay(&h.store, &view.header.run_id).await;
                     h.close().await;
                 }
