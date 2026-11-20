@@ -249,9 +249,8 @@ impl Compiler {
                 .saturating_add(bytes)
                 .saturating_add(size_of::<ExportSummary>());
         }
-        report_bytes = diagnostics.iter().fold(report_bytes, |n, d| {
-            n.saturating_add(crate::diagnostic::diagnostic_size(d))
-        });
+        report_bytes =
+            report_bytes.saturating_add(crate::diagnostic::diagnostic_bytes(&diagnostics));
         if report_bytes > self.config.frontend.max_report_bytes {
             return Err(fail("C_SOURCE_LIMIT", "interface report limit exceeded"));
         }

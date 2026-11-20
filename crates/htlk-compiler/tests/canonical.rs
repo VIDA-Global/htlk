@@ -2694,6 +2694,74 @@ fn canonical_ingress_rechecks_serialization_catalog_and_diagnostic_allowances() 
 }
 
 #[test]
+fn source_report_limit_counts_warnings_and_retained_provenance() {
+    let (base, _) = compiler();
+    let inventory = catalogs();
+    let source = r#"ir_version="0.1"
+      graph test.overlap {
+        description="Two edges may select the same value."
+        inputs={flag=boolean} outputs={value=boolean} nodes{}
+        edges{edge a{from=inputs.flag to=outputs.value when=inputs.flag}
+              edge b{from=inputs.flag to=outputs.value when=inputs.flag}}
+      }"#;
+    let expected = base.compile_source(source, &inventory).unwrap();
+    assert!(!expected.diagnostics.is_empty());
+    assert!(
+        expected
+            .diagnostics
+            .iter()
+            .all(|diagnostic| { diagnostic.severity == analyzer::DiagnosticSeverity::Warning })
+    );
+    assert!(!expected.source_map.is_empty());
+    assert!(
+        expected
+            .documentation
+            .values()
+            .any(|text| { text == "Two edges may select the same value." })
+    );
+
+    let mut bytes = 0;
+    for entry in &expected.source_map {
+        assert_eq!(entry.span.source, SourceLocation::Inline);
+        bytes += size_of::<SourceMapEntry>() + entry.canonical_path.len();
+        bytes += entry.declaration_name.as_deref().unwrap_or_default().len();
+    }
+    for (path, text) in &expected.documentation {
+        bytes += path.len() + text.len();
+    }
+    for diagnostic in &expected.diagnostics {
+        bytes += size_of::<Diagnostic>() + diagnostic.code.len() + diagnostic.message.len();
+        for location in std::iter::once(&diagnostic.location).chain(&diagnostic.related_locations) {
+            bytes += match location {
+                DiagnosticLocation::SourceSpan(span) => {
+                    assert_eq!(span.source, SourceLocation::Inline);
+                    size_of::<SourceSpan>()
+                }
+                DiagnosticLocation::CanonicalRecordPath(path) => path.len(),
+                other => panic!("unexpected standalone diagnostic location: {other:?}"),
+            };
+        }
+    }
+
+    let compile = |max_report_bytes| {
+        let mut config = base.config().clone();
+        config.frontend.max_report_bytes = max_report_bytes;
+        Compiler::new(config)
+            .unwrap()
+            .compile_source(source, &inventory)
+    };
+    let at_limit = compile(bytes).unwrap();
+    assert_eq!(at_limit.diagnostics, expected.diagnostics);
+    assert_eq!(at_limit.source_map, expected.source_map);
+    assert_eq!(at_limit.documentation, expected.documentation);
+    assert_eq!(at_limit.executable_bytes(), expected.executable_bytes());
+    assert_eq!(
+        compile(bytes - 1).unwrap_err().to_string(),
+        "C_SOURCE_LIMIT: compiler report limit exceeded"
+    );
+}
+
+#[test]
 fn compiler_linked_library_keys_and_unbound_generic_signatures_are_validated() {
     let (base, _) = compiler();
     let l = Limits::default();

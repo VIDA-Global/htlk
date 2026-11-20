@@ -192,16 +192,12 @@ impl<'a> Session<'a> {
                 .len()
                 .saturating_add(self.documentation.len()),
         )?;
-        let bytes = self.diagnostic_bytes.saturating_add(
-            self.source_map
-                .iter()
-                .fold(0usize, |n, e| {
-                    n.saturating_add(crate::diagnostic::map_size(e))
-                })
-                .saturating_add(self.documentation.iter().fold(0usize, |n, (k, v)| {
-                    n.saturating_add(k.len()).saturating_add(v.len())
-                })),
-        );
+        let bytes = self
+            .diagnostic_bytes
+            .saturating_add(crate::diagnostic::provenance_bytes(
+                &self.source_map,
+                &self.documentation,
+            ));
         if bytes > self.compiler.config.frontend.max_report_bytes {
             return Err(fail(
                 "C_SOURCE_LIMIT",
@@ -1284,14 +1280,9 @@ impl<'a> Session<'a> {
                 d
             }));
         crate::diagnostic::sort(&mut success.diagnostics);
-        let bytes = success.source_map.iter().fold(0usize, |n, e| {
-            n.saturating_add(crate::diagnostic::map_size(e))
-        }) + success.documentation.iter().fold(0usize, |n, (p, d)| {
-            n.saturating_add(p.len()).saturating_add(d.len())
-        });
-        let bytes = success.diagnostics.iter().fold(bytes, |n, d| {
-            n.saturating_add(crate::diagnostic::diagnostic_size(d))
-        });
+        let bytes =
+            crate::diagnostic::provenance_bytes(&success.source_map, &success.documentation)
+                .saturating_add(crate::diagnostic::diagnostic_bytes(&success.diagnostics));
         if bytes > self.compiler.config.frontend.max_report_bytes {
             return Err(fail("C_SOURCE_LIMIT", "compiler report limit exceeded"));
         }
