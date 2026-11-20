@@ -37,8 +37,9 @@ Docker Engine 29.7.2, actionlint 1.7.12, cargo-deny 0.20.2 and cargo-about 0.9.2
   all five crates packaged and verified.
 - `cargo test --workspace --locked` on SQLite: 858 passed, including doctests.
 - [Hosted CI at the baseline revision](https://github.com/thomasquintana/htlk/actions/runs/44669389803):
-  Quality (including all-feature tests), branch coverage, dependency policy and
-  workflow syntax passed. The PostgreSQL 18 job hit a transient `Fenced` result
+  Quality (including all-feature tests), line and branch coverage, dependency
+  policy, workflow syntax and PostgreSQL 16 qualification passed. The PostgreSQL
+  18 job hit a transient `Fenced` result
   while polling `inspect_run` in `mcp_content_library`. The polling test unwraps
   a snapshot result that the shared E2E poller already treats as retryable.
   Check this test harness boundary in chunk 04; repeat both PostgreSQL versions

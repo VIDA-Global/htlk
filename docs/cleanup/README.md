@@ -13,3 +13,8 @@ storage behavior do not change.
 | 03 | [Compiler catalog selection](03-compiler-catalog-selection.md) | 02 |
 | 04 | [Runtime test boundaries](04-runtime-test-boundaries.md) | 03 |
 | 05 | [Final verification](05-final-verification.md) | 01–04 |
+
+The final workspace checks, packaging, fixture validation, both SQLite suites,
+and PostgreSQL 16 passed. The PostgreSQL 18 suite had one classification test
+failure that passed on focused rerun. The catalog benchmark showed no meaningful
+timing change and retained the same executable fingerprint.
