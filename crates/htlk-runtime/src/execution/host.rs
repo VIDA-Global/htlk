@@ -68,7 +68,10 @@ impl Handler<Command> for Supervisor {
         let actor = self.active.get(&msg.run).cloned();
         Box::pin(async move {
             let actor = actor.ok_or_else(|| RuntimeError::failure(FailureCode::Fenced))?;
-            actor.send(msg).await.map_err(|_| err())?
+            actor
+                .send(msg)
+                .await
+                .map_err(|_| RuntimeError::failure(FailureCode::Fenced))?
         })
     }
 }
@@ -83,7 +86,83 @@ impl Handler<Command> for Coordinator {
         let runtime = self.runtime.clone();
         let lease = self.state.lease().cloned();
         AtomicResponse::new(Box::pin(
-            async move { apply(runtime, lease.ok_or_else(err)?, msg).await }.into_actor(self),
+            async move { apply(runtime, lease.ok_or_else(err)?, msg).await }
+                .into_actor(self)
+                .map(|result, _, ctx| {
+                    if result.is_ok() {
+                        ctx.notify(super::Pulse);
+                    }
+                    result
+                }),
+        ))
+    }
+}
+
+struct WakeCommand(Command);
+impl Message for WakeCommand {
+    type Result = Result<Value, RuntimeError>;
+}
+impl Handler<WakeCommand> for Supervisor {
+    type Result = AtomicResponse<Self, Result<Value, RuntimeError>>;
+    fn handle(&mut self, msg: WakeCommand, _: &mut Context<Self>) -> Self::Result {
+        let selected =
+            self.config.scope == super::ExecutionScope::All || self.attached.contains(&msg.0.run);
+        let runtime = self.runtime.clone();
+        let lease_ms = self.config.lease_ms;
+        AtomicResponse::new(Box::pin(
+            async move {
+                if !selected {
+                    return Err(RuntimeError::failure(FailureCode::Fenced));
+                }
+                let command = msg.0;
+                if let Some(response) = recorded(&runtime, &command).await? {
+                    return Ok(response);
+                }
+                let run = command.run.clone();
+                let wake_at = runtime
+                    .store
+                    .parked_deadline(&run)
+                    .await?
+                    .ok_or_else(|| RuntimeError::failure(FailureCode::Fenced))?;
+                let now = runtime
+                    .store
+                    .coordinator_time(runtime.clock.now_ms()?)
+                    .await?;
+                let owner = runtime.store.reserve_run_id().await?.to_string();
+                let lease = runtime
+                    .store
+                    .acquire_candidate(&run, owner, now, now.saturating_add(lease_ms), true)
+                    .await?;
+                let result = match super::recovery::validate(&runtime, &lease).await {
+                    Ok(()) => apply(runtime.clone(), lease.clone(), command).await,
+                    Err(error) => Err(error),
+                };
+                if !matches!(
+                    result,
+                    Err(RuntimeError::Storage(
+                        crate::store::StoreError::CommitUnknown
+                    ))
+                ) && let Ok(header) = runtime.store.run_header(&run).await
+                    && !header.status.is_terminal()
+                    && header.fence == lease.fence()
+                    && let Ok(observed) = runtime.clock.now_ms()
+                {
+                    let next = if result.is_ok() { observed } else { wake_at };
+                    // The host receipt is already authoritative. A failing
+                    // handoff is recovered by lease expiry; never repeat it
+                    // as part of this command.
+                    let _ = runtime
+                        .store
+                        .park_run(&lease, observed, header.sequence, next, true)
+                        .await;
+                }
+                result
+            }
+            .into_actor(self)
+            .map(|result, _, ctx| {
+                ctx.notify(super::Poll);
+                result
+            }),
         ))
     }
 }
@@ -168,7 +247,14 @@ pub(super) async fn route(runtime: &Runtime, command: Command) -> Result<Value, 
         .as_ref()
         .and_then(actix::WeakAddr::upgrade)
         .ok_or_else(|| RuntimeError::failure(FailureCode::Fenced))?;
-    address.send(command).await.map_err(|_| err())?
+    let first = address.send(command.clone()).await.map_err(|_| err())?;
+    if matches!(&first, Err(error) if error.code() == FailureCode::Fenced) {
+        return address
+            .send(WakeCommand(command))
+            .await
+            .map_err(|_| err())?;
+    }
+    first
 }
 impl Runtime {
     /// Resolves exact-action policy approval. Ordinary replies cannot call this

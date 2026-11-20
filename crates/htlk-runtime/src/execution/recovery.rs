@@ -124,7 +124,7 @@ fn collect(value: &Value, ids: &mut BTreeSet<ArtifactId>) -> Result<(), RuntimeE
     }
     Ok(())
 }
-async fn validate(runtime: &Arc<Runtime>, lease: &RunLease) -> Result<(), RuntimeError> {
+pub(super) async fn validate(runtime: &Arc<Runtime>, lease: &RunLease) -> Result<(), RuntimeError> {
     let header = runtime.store.run_header(lease.run_id()).await?;
     if header.status.is_terminal() {
         return Ok(());

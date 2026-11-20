@@ -630,7 +630,7 @@ pub(super) fn project(
         "run_initialized" => array(&value)?.first(),
         "records_committed" => array(&value)?.get(2),
         "terminal_receipt" | "artifact_expired" => Some(&value),
-        "run_created" | "ownership_acquired" | "ownership_renewed" => None,
+        "run_created" | "ownership_acquired" | "ownership_renewed" | "ownership_parked" => None,
         _ => return Err(StoreError::Corrupt),
     };
     if let Some(body) = body {

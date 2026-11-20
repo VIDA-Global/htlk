@@ -45,6 +45,7 @@ pub(super) struct ScopeState {
 pub(super) enum Progress {
     Changed,
     Blocked,
+    Quiescent { sequence: i64, wake_at: i64 },
     Terminal,
 }
 pub(super) async fn tick(runtime: Arc<Runtime>, lease: RunLease) -> Result<Progress, RuntimeError> {
@@ -308,7 +309,10 @@ async fn tick_observed(
             observations.pop_first();
         }
         observations.insert(lease.run_id().clone(), (header.sequence, wake_at));
-        return Ok(Progress::Blocked);
+        return Ok(Progress::Quiescent {
+            sequence: header.sequence,
+            wake_at,
+        });
     }
     Err(RuntimeError::failure(FailureCode::Invariant))
 }

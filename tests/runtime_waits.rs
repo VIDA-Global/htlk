@@ -124,6 +124,83 @@ async fn terminal(runtime: &Runtime, run: &RunId) -> RunStatus {
     panic!("run did not terminate")
 }
 #[test]
+fn parked_waits_release_the_only_execution_slot() {
+    actix::System::new().block_on(async {
+        let (runtime, engine, _, first, store) = setup().await;
+        let caller = context("alice");
+        let first_wait = open(&runtime, &first).await;
+        let config = ExecutionConfig {
+            max_runs: 1,
+            workers: 1,
+            poll_interval: Duration::from_millis(2),
+            ..Default::default()
+        };
+        let wait_for_park = |run: RunId| {
+            let store = store.clone();
+            async move {
+                let until = std::time::Instant::now() + Duration::from_secs(20);
+                loop {
+                    let header = store.run_header(&run).await.unwrap();
+                    if header.owner.is_none() && header.fence > 0 {
+                        return header;
+                    }
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "wait did not park: {header:?}"
+                    );
+                    actix::clock::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        };
+        let first_header = wait_for_park(first.clone()).await;
+        engine.shutdown().await.unwrap();
+        let engine = ExecutionEngine::launch(runtime.clone(), config).unwrap();
+        let inputs = BTreeMap::from([(
+            "request".parse().unwrap(),
+            InputValue::Inline(Value::Text("queued".into())),
+        )]);
+        let mut others = Vec::new();
+        for i in 0..6 {
+            others.push(
+                runtime
+                    .start_run(
+                        &caller,
+                        first_header.fingerprint,
+                        &inputs,
+                        &format!("queued-{i}"),
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                    .run_id,
+            );
+        }
+        let mut parked = Vec::new();
+        for run in others {
+            parked.push(wait_for_park(run).await);
+        }
+        runtime
+            .submit_reply(
+                &caller,
+                first_wait,
+                Value::Text("accepted".into()),
+                "resume",
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal(&runtime, &first).await, RunStatus::Succeeded);
+        assert!(store.run_header(&first).await.unwrap().fence > first_header.fence);
+        for unchanged in parked {
+            assert_eq!(
+                store.run_header(&unchanged.run_id).await.unwrap(),
+                unchanged
+            );
+        }
+        engine.shutdown().await.unwrap();
+    });
+}
+
+#[test]
 fn reply_type_policy_and_idempotency_are_checked_without_holding_workers() {
     actix::System::new().block_on(async {
         let (runtime, engine, clock, run, store) = setup().await;

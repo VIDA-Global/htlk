@@ -13,6 +13,9 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ### Changed
 
+- Quiescent runs without MCP attempt state park durably and release their active
+  slot. Host commands reacquire parked runs under a higher fence; indexed deadlines
+  wake them without per-run polling. Requires SQLite schema 16 or PostgreSQL layout 3.
 - Active coordinators reuse a bounded committed working set on both backends.
   Successive decisions refresh changed checkpoint metadata, defer known pending
   unconditional dependencies, and recheck the observed journal sequence at commit.

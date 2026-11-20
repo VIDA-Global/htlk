@@ -7,8 +7,8 @@ records are not an additional supported wire format.
 
 ## Storage compatibility
 
-The SQLite application ID is `0x48544c4b`; the private schema version is **15**.
-An empty database initializes in one immediate transaction. Versions 1–14, future
+The SQLite application ID is `0x48544c4b`; the private schema version is **16**.
+An empty database initializes in one immediate transaction. Versions 1–15, future
 versions, foreign application IDs, and nonempty unrecognized databases fail without
 relabeling or deletion. There is no automatic migration or legacy binding decoder.
 Matching `0.1` format labels do not permit changed interpretation of saved effects.
@@ -106,7 +106,7 @@ covers caller procedures.
 The optional `postgres` feature provides native PostgreSQL tables in a dedicated
 host-selected schema. `PostgresStore::initialize` transactionally creates an empty
 recognized layout; `PostgresStore::open` requires existing state. The metadata
-application is `htlk.runtime.postgres`, layout version **2**. Initialization and
+application is `htlk.runtime.postgres`, layout version **3**. Initialization and
 opening also compare the exact embedded layout digest; a matching version label
 cannot reinterpret a different private layout. Initialization and
 runtime operations arbitrate through the same database/schema-scoped transaction
@@ -245,6 +245,7 @@ actor, nondecreasing time, causation, optional command key, and canonical payloa
 run_created:         [fingerprint, root_scope_id]
 ownership_acquired:  [owner, fence, expires_at_ms]
 ownership_renewed:   [owner, fence, expires_at_ms]
+ownership_parked:    [owner, fence, eligible_at_ms]
 records_committed:   [owner, fence, body]
 run_initialized:     [body, [principal, method, fingerprint, key, digest, expiry]]
 terminal_receipt:    body
@@ -337,6 +338,16 @@ An observed pending unconditional dependency can defer that admission until the
 producer changes. Conditional guards and selected artifact values still use the
 ordinary reducer and current access policy. The store rechecks the observed
 sequence for commits based on that working set, alongside normal fence and CAS checks.
+
+An observed quiescent run with no MCP attempt state can release its slot. The
+parking transaction compares the observed sequence and fence, persists the next
+eligible time, clears the owner, and journals the authority handoff. A committed
+reply before this transaction makes the parking proposal stale. A reply after
+parking claims a new fence, validates the checkpoint and commits the command,
+then makes the run eligible for normal scheduling. Failed handoffs recover by
+lease expiry. Provider attempts retain their existing owner and recovery rules.
+The supervisor reconciles eligible IDs in bounded pages, with local wake hints
+following admission, host commands and slot release.
 
 Recovery re-admits all exact origins and checks definition/use IDs, complete frozen
 manifests, artifacts, waits, attempts, normalization observations, and adopted

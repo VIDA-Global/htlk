@@ -365,6 +365,7 @@ fn event_name(e: JournalEvent) -> &'static str {
         JournalEvent::RunCreated => "run_created",
         JournalEvent::OwnershipAcquired => "ownership_acquired",
         JournalEvent::OwnershipRenewed => "ownership_renewed",
+        JournalEvent::OwnershipParked => "ownership_parked",
         JournalEvent::RecordsCommitted => "records_committed",
     }
 }

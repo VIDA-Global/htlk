@@ -76,9 +76,10 @@ pub async fn samples(
         engine.shutdown().await?;
         store.close().await?;
         let header = reader.run_header(&run).await?;
-        let due = header.expires_at_ms.ok_or("missing recovery lease")?;
         let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
-        sleep(Duration::from_millis(due.saturating_sub(now).max(0) as u64)).await;
+        if let Some(due) = header.expires_at_ms {
+            sleep(Duration::from_millis(due.saturating_sub(now).max(0) as u64)).await;
+        }
         println!(
             "sample,recovery_lease_wait,{},1",
             micros(downtime.elapsed())
@@ -88,23 +89,25 @@ pub async fn samples(
         let store = db.open(false).await?;
         let resumed = runtime(&store)?;
         let engine = ExecutionEngine::launch(resumed.clone(), engine_config.clone())?;
-        let takeover = timeout(DEADLINE, async {
-            loop {
-                let current = reader.run_header(&run).await?;
-                if current.status.is_terminal() {
-                    return Err("recovery terminated before host reply".into());
+        if header.owner.is_some() {
+            let takeover = timeout(DEADLINE, async {
+                loop {
+                    let current = reader.run_header(&run).await?;
+                    if current.status.is_terminal() {
+                        return Err("recovery terminated before host reply".into());
+                    }
+                    if current.fence > header.fence {
+                        return Ok::<_, Box<dyn std::error::Error>>(Instant::now());
+                    }
+                    sleep(POLL).await;
                 }
-                if current.fence > header.fence {
-                    return Ok::<_, Box<dyn std::error::Error>>(Instant::now());
-                }
-                sleep(POLL).await;
-            }
-        })
-        .await??;
-        println!(
-            "sample,recovery_reopen_to_fence,{},1",
-            micros(takeover.duration_since(resume))
-        );
+            })
+            .await??;
+            println!(
+                "sample,recovery_reopen_to_fence,{},1",
+                micros(takeover.duration_since(resume))
+            );
+        }
         if checkpoint(reader, &run).await? != wait {
             return Err("recovery changed wait identity".into());
         }
@@ -126,6 +129,15 @@ pub async fn samples(
             }
         })
         .await??;
+        if header.owner.is_none() {
+            if reader.run_header(&run).await?.fence <= header.fence {
+                return Err("parked reply did not take higher authority".into());
+            }
+            println!(
+                "sample,recovery_reopen_to_parked_reply,{},1",
+                micros(resume.elapsed())
+            );
+        }
         let terminal = timeout(DEADLINE, async {
             loop {
                 if reader.run_header(&run).await?.status.is_terminal() {

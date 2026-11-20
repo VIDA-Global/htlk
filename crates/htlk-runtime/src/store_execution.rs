@@ -8,6 +8,122 @@ pub(crate) struct SchedulingPage {
 }
 
 impl SqliteStore {
+    pub(crate) async fn parked_deadline(&self, run: &RunId) -> Result<Option<i64>, StoreError> {
+        let run = run.clone();
+        self.connection.call(move |db| {
+            Ok(db.query_row("SELECT eligible_at_ms FROM runs WHERE run_id=?1 AND status='running' AND owner IS NULL AND eligible_at_ms>0", [run.as_str()], |r| r.get(0)).optional()?)
+        }).await.map_err(StoreError::from_worker)
+    }
+    pub(crate) async fn park_run(
+        &self,
+        lease: &RunLease,
+        observed: i64,
+        sequence: i64,
+        wake_at: i64,
+        command_handoff: bool,
+    ) -> Result<Option<i64>, StoreError> {
+        let limits = self.config.limits.clone();
+        let lease = lease.clone();
+        self.connection.call(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let header = load_header(&tx, &lease.run_id)?;
+            let now = runs::observed_time(&tx, observed)?;
+            check_authority(&header, &lease, now)?;
+            if header.status.is_terminal() || header.sequence != sequence { return Err(StoreError::Conflict); }
+            if !command_handoff && wake_at <= now { return Err(StoreError::Conflict); }
+            let wake_at = wake_at.max(now);
+            // Native sessions may carry live provider state across waits. Do not
+            // release their fence or transfer an ambiguous attempt to a new owner.
+            if !command_handoff {
+                let provider_state: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM records WHERE run_id=?1 AND family='attempt')", [lease.run_id.as_str()], |r| r.get(0))?;
+                if provider_state { return Ok(None); }
+            }
+            let sequence = sequence.checked_add(1).ok_or(StoreError::Invalid)?;
+            tx.execute("UPDATE runs SET owner=NULL,lease_expires_ms=NULL,eligible_at_ms=?2,sequence=?3,last_time_ms=?4 WHERE run_id=?1", params![lease.run_id.as_str(), wake_at, sequence, now])?;
+            let payload = lease_payload(&lease.owner, lease.fence, wake_at, &limits)?;
+            append_event(&tx, lease.run_id.as_str(), sequence, EventMeta { kind: "ownership_parked", actor: &lease.owner, timestamp: now, causation: "ownership", command: None }, &payload, &limits)?;
+            tx.commit()?;
+            Ok(Some(sequence))
+        }).await.map_err(StoreError::from_worker)
+    }
+
+    pub(crate) async fn parked_at(
+        &self,
+        run: &RunId,
+        sequence: i64,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let run = run.clone();
+        self.connection.call(move |db| {
+            Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM runs WHERE run_id=?1 AND status='running' AND owner IS NULL AND sequence=?2 AND eligible_at_ms>?3)", params![run.as_str(), sequence, now], |r| r.get(0))?)
+        }).await.map_err(StoreError::from_worker)
+    }
+
+    pub(crate) async fn due_runs(
+        &self,
+        observed: i64,
+        limit: usize,
+        selected: Option<Vec<RunId>>,
+    ) -> Result<(i64, Vec<RunId>), StoreError> {
+        let limit = self.page_size(limit)?;
+        if selected
+            .as_ref()
+            .is_some_and(|runs| runs.len() > limit as usize)
+        {
+            return Err(StoreError::Invalid);
+        }
+        if matches!(selected.as_deref(), Some([])) {
+            return Ok((observed, Vec::new()));
+        }
+        let limits = self.config.limits.clone();
+        self.connection
+            .call(move |db| {
+                let tx = db.transaction_with_behavior(TransactionBehavior::Deferred)?;
+                let now = runs::observed_time(&tx, observed)?;
+                let mut result = Vec::new();
+                let mut bytes = 0usize;
+                {
+                    let selected: Vec<_> = selected
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(RunId::as_str)
+                        .collect();
+                    let mut sql = String::from(
+                        "SELECT run_id FROM runs WHERE status='running' AND eligible_at_ms<=?1",
+                    );
+                    let mut parameters: Vec<&dyn rusqlite::ToSql> = vec![&now, &limit];
+                    if !selected.is_empty() {
+                        sql.push_str(" AND (");
+                        for (index, run) in selected.iter().enumerate() {
+                            use std::fmt::Write;
+                            if index > 0 {
+                                sql.push_str(" OR ");
+                            }
+                            write!(sql, "run_id=?{}", index + 3).expect("string format");
+                            parameters.push(run);
+                        }
+                        sql.push(')');
+                    }
+                    sql.push_str(" ORDER BY eligible_at_ms,run_id LIMIT ?2");
+                    let mut statement = tx.prepare(&sql)?;
+                    let mut rows = statement.query(parameters.as_slice())?;
+                    while let Some(row) = rows.next()? {
+                        let id = transitions::text(row, 0, &limits)?;
+                        bytes = bytes.checked_add(id.len() + 1).ok_or(StoreError::Invalid)?;
+                        if bytes > limits.max_document_bytes {
+                            break;
+                        }
+                        result.push(RunId::new(id, &limits).map_err(|_| StoreError::Corrupt)?);
+                    }
+                }
+                tx.commit()?;
+                Ok((now, result))
+            })
+            .await
+            .map_err(StoreError::from_worker)
+    }
+
     /// Observe the header, logical time and first scope page together without
     /// advancing the store clock. Acceptance still samples the authoritative clock.
     pub(crate) async fn scheduling_page(

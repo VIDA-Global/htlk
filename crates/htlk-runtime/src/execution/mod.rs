@@ -232,6 +232,14 @@ impl Message for Poll {
     type Result = ();
 }
 
+pub(crate) fn hint(runtime: &Runtime) {
+    if let Ok(address) = runtime.execution.lock()
+        && let Some(address) = address.as_ref().and_then(WeakAddr::upgrade)
+    {
+        address.do_send(Poll);
+    }
+}
+
 struct AttachRun(RunId);
 impl Message for AttachRun {
     type Result = Result<(), RuntimeError>;
@@ -272,14 +280,15 @@ impl Message for Finished {
 }
 impl Handler<Finished> for Supervisor {
     type Result = ();
-    fn handle(&mut self, msg: Finished, _: &mut Self::Context) {
+    fn handle(&mut self, msg: Finished, ctx: &mut Self::Context) {
         self.active.remove(&msg.0);
+        ctx.notify(Poll);
     }
 }
 impl Handler<Poll> for Supervisor {
     type Result = ();
     fn handle(&mut self, _: Poll, ctx: &mut Self::Context) {
-        if self.polling {
+        if self.polling || self.active.len() >= self.config.max_runs {
             return;
         }
         self.polling = true;
@@ -290,7 +299,6 @@ impl Handler<Poll> for Supervisor {
             .config
             .max_runs
             .saturating_sub(self.active.len())
-            .max(1)
             .min(runtime.store.config().max_page_size);
         // Page the selected IDs themselves: unrelated store runs cannot starve
         // an attached run, acquire leases or trigger deadline/recovery mutations.
@@ -304,30 +312,20 @@ impl Handler<Poll> for Supervisor {
         });
         ctx.spawn(
             async move {
-                let runs = match attached {
-                    Some(runs) => runs,
-                    None => runtime.store.running_runs(cursor.as_ref(), room).await?,
-                };
+                let observed = runtime.clock.now_ms()?;
+                let (now, runs) = runtime
+                    .store
+                    .due_runs(observed, room, attached.clone())
+                    .await?;
                 let mut ready = Vec::new();
                 for run in &runs {
                     if active.contains(run) {
                         continue;
                     }
-                    let header = runtime.store.run_header(run).await?;
-                    if header.status.is_terminal() {
-                        continue;
-                    }
-                    let now = runtime
-                        .store
-                        .coordinator_time(runtime.clock.now_ms()?)
-                        .await?;
-                    if header.owner.is_some() && header.expires_at_ms.is_some_and(|due| now < due) {
-                        continue;
-                    }
                     let owner = runtime.store.reserve_run_id().await?;
                     ready.push((run.clone(), owner.to_string(), now));
                 }
-                Ok::<_, RuntimeError>((runs, ready))
+                Ok::<_, RuntimeError>((attached.unwrap_or_default(), ready))
             }
             .into_actor(self)
             .map(move |result, actor, ctx| {
@@ -540,6 +538,40 @@ impl Handler<Pulse> for Coordinator {
                             ctx.notify(Pulse)
                         }
                         Ok(Ok(step::Progress::Blocked)) => {}
+                        Ok(Ok(step::Progress::Quiescent { sequence, wake_at })) => {
+                            let runtime = actor.runtime.clone();
+                            let Some(lease) = actor.state.lease().cloned() else {
+                                ctx.stop();
+                                return;
+                            };
+                            ctx.wait(
+                                async move {
+                                    Ok::<_, RuntimeError>(
+                                        runtime
+                                            .store
+                                            .park_run(
+                                                &lease,
+                                                runtime.clock.now_ms()?,
+                                                sequence,
+                                                wake_at,
+                                                false,
+                                            )
+                                            .await?,
+                                    )
+                                }
+                                .into_actor(actor)
+                                .map(|result, _, ctx| match result {
+                                    Ok(Some(_))
+                                    | Err(RuntimeError::Storage(
+                                        StoreError::Fenced | StoreError::CommitUnknown,
+                                    )) => ctx.stop(),
+                                    Err(RuntimeError::Storage(StoreError::Conflict)) => {
+                                        ctx.notify(Pulse)
+                                    }
+                                    _ => {}
+                                }),
+                            );
+                        }
                         Ok(Ok(step::Progress::Terminal)) => ctx.stop(),
                         Ok(Err(RuntimeError::Storage(StoreError::Fenced))) => ctx.stop(),
                         Ok(Err(RuntimeError::Storage(

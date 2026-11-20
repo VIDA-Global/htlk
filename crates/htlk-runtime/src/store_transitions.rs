@@ -114,6 +114,8 @@ pub enum JournalEvent {
     OwnershipAcquired,
     /// Same owner/fence with renewed expiry.
     OwnershipRenewed,
+    /// A verified quiescent run released the live owner until an external wake or timer.
+    OwnershipParked,
     /// Complete revisioned records and optional terminal/root update.
     RecordsCommitted,
 }
@@ -126,6 +128,7 @@ impl JournalEvent {
             "run_created" => Ok(Self::RunCreated),
             "ownership_acquired" => Ok(Self::OwnershipAcquired),
             "ownership_renewed" => Ok(Self::OwnershipRenewed),
+            "ownership_parked" => Ok(Self::OwnershipParked),
             "records_committed" => Ok(Self::RecordsCommitted),
             _ => Err(StoreError::Corrupt),
         }
