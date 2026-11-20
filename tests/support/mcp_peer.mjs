@@ -99,6 +99,10 @@ if (transport === 'stdio') {
     const message = JSON.parse(line);
     if (delayMs > 0) await delayTool(message);
     const response = reply(message);
+    if (mode === 'missing-eof' && message.method === 'tools/list' && message.params?.cursor === 'second-page') {
+      // The request is logged, but the peer exits before writing the reply.
+      process.exit(0);
+    }
     if (response) process.stdout.write(response + '\n');
   }
 } else {

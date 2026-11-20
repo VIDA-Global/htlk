@@ -24,6 +24,7 @@ node tools/validate-executable-fixtures.mjs
 node --test tools/validate-docs.test.mjs tools/coverage.test.mjs tools/discover-mcp.test.mjs
 bash tools/check-rust.sh
 cargo test --workspace --all-features --locked
+cargo test --workspace --no-default-features --features sqlite --lib --examples --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 cargo deny check
 cargo package --workspace --all-features --locked --target-dir "$(mktemp -d)"

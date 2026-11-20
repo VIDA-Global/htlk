@@ -5,7 +5,7 @@ use crate::executable::{
     digest::Digest,
 };
 use crate::{
-    Compiler, DiagnosticLocation, MCPCatalogInputs, SourceMapEntry,
+    Compiler, Diagnostic, DiagnosticLocation, MCPCatalogInputs, SourceMapEntry,
     ast::*,
     catalogs::CatalogKind,
     diagnostic::{Result, fail},
@@ -101,7 +101,7 @@ pub(crate) struct Session<'a> {
     pub pool: DocumentFields,
     pub source_map: Vec<SourceMapEntry>,
     pub documentation: BTreeMap<String, String>,
-    pub diagnostics: Vec<crate::Diagnostic>,
+    pub diagnostics: Vec<Diagnostic>,
     budget: FrontendBudget<'a>,
     diagnostic_bytes: usize,
 }
@@ -1178,30 +1178,31 @@ impl<'a> Session<'a> {
     }
     pub fn source_error(&self, mut e: crate::CompilationFailure) -> crate::CompilationFailure {
         for d in &mut e.diagnostics {
-            d.location = self.source_location(&d.location);
-            d.related_locations = d
-                .related_locations
-                .iter()
-                .map(|l| self.source_location(l))
-                .collect();
+            self.remap_diagnostic(d);
         }
         e
     }
-    pub(crate) fn source_location(&self, l: &DiagnosticLocation) -> DiagnosticLocation {
-        if let DiagnosticLocation::CanonicalRecordPath(p) = l
-            && let Some(entry) = self
+    pub(crate) fn remap_diagnostic(&self, diagnostic: &mut Diagnostic) {
+        for location in
+            std::iter::once(&mut diagnostic.location).chain(&mut diagnostic.related_locations)
+        {
+            let DiagnosticLocation::CanonicalRecordPath(path) = location else {
+                continue;
+            };
+            if let Some(entry) = self
                 .source_map
                 .iter()
                 .filter(|e| {
-                    p == &e.canonical_path
-                        || p.strip_prefix(&e.canonical_path)
+                    *path == e.canonical_path
+                        || path
+                            .strip_prefix(&e.canonical_path)
                             .is_some_and(|s| s.starts_with('/'))
                 })
                 .max_by_key(|e| e.canonical_path.len())
-        {
-            return DiagnosticLocation::SourceSpan(entry.span.clone());
+            {
+                *location = DiagnosticLocation::SourceSpan(entry.span.clone());
+            }
         }
-        l.clone()
     }
     pub fn finish(&mut self, module: usize) -> Result<crate::CompilationSuccess> {
         let graphs = self.modules[module]
@@ -1224,12 +1225,7 @@ impl<'a> Session<'a> {
             .compile_document(doc, self.catalogs)
             .map_err(|e| self.source_error(e))?;
         for d in &mut success.diagnostics {
-            d.location = self.source_location(&d.location);
-            d.related_locations = d
-                .related_locations
-                .iter()
-                .map(|l| self.source_location(l))
-                .collect();
+            self.remap_diagnostic(d);
         }
         let value = success
             .canonical_document
@@ -1261,12 +1257,7 @@ impl<'a> Session<'a> {
         success
             .diagnostics
             .extend(self.diagnostics.iter().cloned().map(|mut d| {
-                d.location = self.source_location(&d.location);
-                d.related_locations = d
-                    .related_locations
-                    .iter()
-                    .map(|l| self.source_location(l))
-                    .collect();
+                self.remap_diagnostic(&mut d);
                 d
             }));
         crate::diagnostic::sort(&mut success.diagnostics);

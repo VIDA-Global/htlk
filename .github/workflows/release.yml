@@ -110,6 +110,9 @@ jobs:
           cargo test --workspace --all-features --locked
           cargo doc --workspace --all-features --no-deps --locked
 
+      - name: Test libraries and examples with SQLite only
+        run: cargo test --workspace --no-default-features --features sqlite --lib --examples --locked
+
       - name: Upload API documentation
         uses: actions/upload-artifact@v7
         with:

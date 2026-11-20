@@ -87,9 +87,10 @@ HTLK_TEST_BACKEND=postgres cargo test --workspace --all-features --locked
 
 CI and releases run that complete campaign on PostgreSQL 16 and 18 through
 `.github/workflows/postgres.yml`. Default-feature and backend-only compilation are
-checked independently, including PostgreSQL-only host-example tests. SQLite-native
-format/fault tests require its feature; shared behavioral tests select the enabled
-backend when only one is compiled.
+checked independently. CI and releases also execute the SQLite-only workspace
+library and example tests and the PostgreSQL-only runtime library and host example
+tests. SQLite-native format/fault tests require its feature; shared behavioral
+tests select the enabled backend when only one is compiled.
 
 `crates/htlk-runtime/tests/postgres_store.rs` additionally uses an independent
 plaintext loopback protocol proxy that observes PostgreSQL's successful COMMIT

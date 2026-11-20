@@ -662,7 +662,11 @@ fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{ffi::OsString, path::PathBuf};
+    use std::{
+        ffi::OsString,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
     fn arguments(timeout: Option<&str>) -> Vec<OsString> {
         let mut args = Vec::new();
@@ -750,12 +754,14 @@ mod tests {
     struct Logs(PathBuf);
     impl Logs {
         fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
             let nonce = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
+            let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "htlk-example-timeout-{}-{nonce}",
+                "htlk-example-timeout-{}-{nonce}-{sequence}",
                 std::process::id()
             ));
             std::fs::create_dir(&path).unwrap();

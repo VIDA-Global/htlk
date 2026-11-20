@@ -1459,34 +1459,68 @@ fn typed_bundle_rejects_extra_sources_before_snapshot_processing() {
 }
 
 #[test]
-fn conditional_writer_warnings_and_deduplicated_origins_survive_inspection() {
+fn conditional_writer_warning_points_to_both_authored_edges() {
     let (compiler, _) = compiler();
     let source = r#"ir_version="0.1"
       export task choose{inputs={flag=boolean} outputs={value=boolean} nodes{} edges{
         edge first{from=inputs.flag to=outputs.value when=inputs.flag}
         edge second{from=inputs.flag to=outputs.value when=inputs.flag}
       }}"#;
+
     let main = r#"ir_version="0.1" import library from "self/library" graph test.choose{inputs={flag=boolean} outputs={value=boolean} nodes{choose=use(library.choose)} edges{edge flag{from=inputs.flag to=choose.inputs.flag} edge value{from=choose.outputs.value to=outputs.value}}}"#;
     let bundle = bundle_with_sources(&[("main", main), ("library", source)]);
-    let report = compiler
-        .inspect_module(
-            &bundle,
-            &ModuleRef {
-                package_digest: bundle.entry.package_digest,
+    let module = ModuleRef {
+        package_digest: bundle.entry.package_digest,
+        module_path: "library".into(),
+    };
+    let catalogs = catalogs();
+    let edge = |text: &str| {
+        let start_byte = source.find(text).unwrap();
+        DiagnosticLocation::SourceSpan(SourceSpan {
+            source: SourceLocation::Module {
+                package_digest: module.package_digest,
                 module_path: "library".into(),
+                source_path: "src/library.htlk".into(),
             },
-            &[],
-            &catalogs(),
-        )
+            start_byte,
+            end_byte: start_byte + text.len(),
+        })
+    };
+    let warning = Diagnostic {
+        code: "W_CONDITIONAL_WRITERS".into(),
+        severity: analyzer::DiagnosticSeverity::Warning,
+        message: "Candidate guards may overlap; runtime enforces unique selection.".into(),
+        location: edge("edge first{from=inputs.flag to=outputs.value when=inputs.flag}"),
+        related_locations: vec![edge(
+            "edge second{from=inputs.flag to=outputs.value when=inputs.flag}",
+        )],
+    };
+    let report = compiler
+        .inspect_module(&bundle, &module, &["choose".into()], &catalogs)
         .unwrap();
-    assert_eq!(report.diagnostics.len(), 1);
-    assert_eq!(report.diagnostics[0].code, "W_CONDITIONAL_WRITERS");
-    assert!(matches!(
-        report.diagnostics[0].location,
-        DiagnosticLocation::SourceSpan(_)
-    ));
-    let output = compiler.compile_bundle(&bundle, &catalogs()).unwrap();
-    assert_eq!(output.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics, std::slice::from_ref(&warning));
+    let output = compiler.compile_bundle(&bundle, &catalogs).unwrap();
+    assert_eq!(output.diagnostics, std::slice::from_ref(&warning));
+
+    let [ExportSummary::Task { scope_digest, .. }] = report.exports.as_slice() else {
+        panic!("expected inspection of the choose task");
+    };
+    let canonical_edge = |index| {
+        DiagnosticLocation::CanonicalRecordPath(format!("/scopes/{scope_digest}/edges/{index}"))
+    };
+    let canonical = compiler
+        .compile_document(output.canonical_document().clone(), &catalogs)
+        .unwrap();
+    assert_eq!(
+        canonical.diagnostics,
+        [Diagnostic {
+            location: canonical_edge(0),
+            related_locations: vec![canonical_edge(1)],
+            ..warning
+        }],
+    );
+    assert_eq!(canonical.fingerprint(), output.fingerprint());
+    assert_eq!(canonical.executable_bytes(), output.executable_bytes());
 }
 
 #[test]
