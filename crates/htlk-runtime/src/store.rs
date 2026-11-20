@@ -44,8 +44,11 @@ pub use mcp::{
     McpSubscriptionClaim, McpSubscriptionIntent, McpSubscriptionLimits, McpSubscriptionOperation,
     McpSubscriptionOutcome, McpSubscriptionState, McpWorkClaim, McpWorkState,
 };
+#[path = "store_partitions.rs"]
+mod partitions;
 #[path = "store_retention.rs"]
 mod retention;
+pub use partitions::{PartitionPositions, StorePartitions};
 
 #[path = "store_execution.rs"]
 mod execution;
@@ -260,7 +263,7 @@ impl Store {
         self.check_text(&owner)?;
         let limits = self.config.limits.clone();
         let run = run.clone();
-        self.connection.call(move |db| -> Result<RunLease, StoreError> {
+        self.connection.write_run(run.to_string(), move |db| -> Result<RunLease, StoreError> {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let header = load_header(&tx, &run)?;
             if header.status.is_terminal() { return Err(StoreError::Terminal); }
@@ -295,7 +298,7 @@ impl Store {
         check_lease_times(now_ms, expires_at_ms)?;
         let limits = self.config.limits.clone();
         let lease = lease.clone();
-        self.connection.call(move |db| -> Result<(), StoreError> {
+        self.connection.write_run(lease.run_id().to_string(), move |db| -> Result<(), StoreError> {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let header = load_header(&tx, &lease.run_id)?;
             let now = now_ms.max(header.last_time_ms);
@@ -317,7 +320,7 @@ impl Store {
     pub async fn run_header(&self, run: &RunId) -> Result<RunHeader, StoreError> {
         let run = run.clone();
         self.connection
-            .call(move |db| load_header(db, &run))
+            .read(move |db| load_header(db, &run))
             .await
             .map_err(StoreError::from_worker)
     }

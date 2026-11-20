@@ -43,6 +43,7 @@ pub fn native_profile(
         include_bytes!("store_replay.rs"),
         include_bytes!("store_inspection.rs"),
         include_bytes!("store_inspection.sql"),
+        include_bytes!("store_partitions.rs"),
         include_bytes!("inspection.rs"),
         include_bytes!("inspection_navigation.rs"),
         include_bytes!("inspection_tokens.rs"),

@@ -109,12 +109,15 @@ recognized layout; `PostgresStore::open` requires existing state. The metadata
 application is `htlk.runtime.postgres`, layout version **3**. Initialization and
 opening also compare the exact embedded layout digest; a matching version label
 cannot reinterpret a different private layout. Initialization and
-runtime operations arbitrate through the same database/schema-scoped transaction
-advisory lock. Each admitted operation uses one primary connection and a READ
-COMMITTED transaction; domain transaction boundaries use savepoints inside it.
-The lock is acquired before domain reads, preserving SQLite's serialized writer
-semantics across processes, including retention, callbacks, and journal cursors.
-Read operations currently acquire the same gate for coherent multi-query views.
+multi-domain operations use an exclusive database/schema-scoped transaction
+advisory lock. Ordinary commits, acquisition, renewal, and parking take the shared
+form of that gate and then lock only the target run row. Exclusive operations
+coordinate retention, callback accounting, initialization, and the durable time
+watermark against those run writers. Journaled writers lock the inspection clock
+at publication and hold it through physical commit, preserving committed positions
+and ordinals. Domain write boundaries use savepoints inside READ COMMITTED
+transactions. Selected scheduling, journal, and historical reads use REPEATABLE
+READ READ ONLY transactions without an advisory lock.
 The PostgreSQL driver caches at most 256 prepared statements. Single-row lookups
 use their native prepared query directly; scans use server cursors with a bounded
 16-row wire buffer and incremental domain decoding/page accounting.

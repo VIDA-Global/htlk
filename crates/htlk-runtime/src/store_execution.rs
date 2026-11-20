@@ -10,7 +10,7 @@ pub(crate) struct SchedulingPage {
 impl SqliteStore {
     pub(crate) async fn parked_deadline(&self, run: &RunId) -> Result<Option<i64>, StoreError> {
         let run = run.clone();
-        self.connection.call(move |db| {
+        self.connection.read(move |db| {
             Ok(db.query_row("SELECT eligible_at_ms FROM runs WHERE run_id=?1 AND status='running' AND owner IS NULL AND eligible_at_ms>0", [run.as_str()], |r| r.get(0)).optional()?)
         }).await.map_err(StoreError::from_worker)
     }
@@ -24,7 +24,7 @@ impl SqliteStore {
     ) -> Result<Option<i64>, StoreError> {
         let limits = self.config.limits.clone();
         let lease = lease.clone();
-        self.connection.call(move |db| {
+        self.connection.write_run(lease.run_id().to_string(), move |db| {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let header = load_header(&tx, &lease.run_id)?;
             let now = runs::observed_time(&tx, observed)?;
@@ -54,7 +54,7 @@ impl SqliteStore {
         now: i64,
     ) -> Result<bool, StoreError> {
         let run = run.clone();
-        self.connection.call(move |db| {
+        self.connection.read(move |db| {
             Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM runs WHERE run_id=?1 AND status='running' AND owner IS NULL AND sequence=?2 AND eligible_at_ms>?3)", params![run.as_str(), sequence, now], |r| r.get(0))?)
         }).await.map_err(StoreError::from_worker)
     }
@@ -77,7 +77,7 @@ impl SqliteStore {
         }
         let limits = self.config.limits.clone();
         self.connection
-            .call(move |db| {
+            .read(move |db| {
                 let tx = db.transaction_with_behavior(TransactionBehavior::Deferred)?;
                 let now = runs::observed_time(&tx, observed)?;
                 let mut result = Vec::new();
@@ -135,7 +135,7 @@ impl SqliteStore {
         let run = run.clone();
         let config = self.config.clone();
         self.connection
-            .call(move |db| {
+            .read(move |db| {
                 let tx = db.transaction_with_behavior(TransactionBehavior::Deferred)?;
                 let header = load_header(&tx, &run)?;
                 let (now, scopes) = if header.status.is_terminal() {
@@ -362,7 +362,7 @@ impl SqliteStore {
             self.config.limits.clone(),
         );
         self.connection
-            .call(move |db| record_page(db, &run, family, after.as_deref(), page_size, &limits))
+            .read(move |db| record_page(db, &run, family, after.as_deref(), page_size, &limits))
             .await
             .map_err(StoreError::from_worker)
     }

@@ -196,12 +196,15 @@ impl SqliteStore {
         let prepared = PreparedTransition::new(lease, transition, &limits)?;
         let lease = lease.clone();
         self.connection
-            .call(move |db| -> Result<CommitReceipt, StoreError> {
-                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let receipt = prepared.apply_at_sequence(&tx, &lease, &limits, sequence)?;
-                tx.commit()?;
-                Ok(receipt)
-            })
+            .write_run(
+                lease.run_id().to_string(),
+                move |db| -> Result<CommitReceipt, StoreError> {
+                    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    let receipt = prepared.apply_at_sequence(&tx, &lease, &limits, sequence)?;
+                    tx.commit()?;
+                    Ok(receipt)
+                },
+            )
             .await
             .map_err(StoreError::from_worker)
     }
@@ -212,7 +215,7 @@ impl SqliteStore {
     pub async fn record(&self, run: &RunId, key: &RecordKey) -> Result<StoredRecord, StoreError> {
         self.check_text(&key.id)?;
         let (run, key, limits) = (run.clone(), key.clone(), self.config.limits.clone());
-        self.connection.call(move |db|->Result<StoredRecord,StoreError>{
+        self.connection.read(move |db|->Result<StoredRecord,StoreError>{
             let mut statement=db.prepare("SELECT revision,final,payload FROM records WHERE run_id=?1 AND family=?2 AND record_id=?3")?;
             let mut rows=statement.query(params![run.as_str(),key.family.as_str(),key.id])?;
             let row=rows.next()?.ok_or(StoreError::Missing)?;
@@ -250,7 +253,7 @@ impl SqliteStore {
             return Err(StoreError::Invalid);
         }
         let (run, limits) = (run.clone(), self.config.limits.clone());
-        self.connection.call(move |db|->Result<Vec<JournalEntry>,StoreError>{
+        self.connection.read(move |db|->Result<Vec<JournalEntry>,StoreError>{
             let mut statement=db.prepare("SELECT sequence,event_type,record_version,actor,timestamp_ms,causation,command_id,payload FROM journal WHERE run_id=?1 AND sequence>?2 AND sequence<=?4 ORDER BY sequence LIMIT ?3")?;
             let mut rows=statement.query(params![run.as_str(),after,count,through])?;
             let mut result=Vec::new();

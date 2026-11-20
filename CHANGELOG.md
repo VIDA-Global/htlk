@@ -13,6 +13,10 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ### Changed
 
+- PostgreSQL scheduling and historical reads use ungated repeatable-read snapshots.
+  Ordinary single-run writes coordinate on the run row and order publication at
+  the inspection clock. Hosts can route independent SQLite or PostgreSQL stores
+  with per-store inspection positions.
 - Quiescent runs without MCP attempt state park durably and release their active
   slot. Host commands reacquire parked runs under a higher fence; indexed deadlines
   wake them without per-run polling. Requires SQLite schema 16 or PostgreSQL layout 3.

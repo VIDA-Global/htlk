@@ -89,10 +89,48 @@ impl Connection {
         R: Send + 'static,
         E: Send + 'static,
     {
+        self.call_mode(rusqlite::OperationMode::Exclusive, operation)
+            .await
+    }
+
+    pub(crate) async fn read<R, E>(
+        &self,
+        operation: impl FnOnce(&mut rusqlite::Connection) -> Result<R, E> + Send + 'static,
+    ) -> Result<R, Error<E>>
+    where
+        R: Send + 'static,
+        E: Send + 'static,
+    {
+        self.call_mode(rusqlite::OperationMode::Read, operation)
+            .await
+    }
+
+    pub(crate) async fn write_run<R, E>(
+        &self,
+        run: String,
+        operation: impl FnOnce(&mut rusqlite::Connection) -> Result<R, E> + Send + 'static,
+    ) -> Result<R, Error<E>>
+    where
+        R: Send + 'static,
+        E: Send + 'static,
+    {
+        self.call_mode(rusqlite::OperationMode::Run(run), operation)
+            .await
+    }
+
+    async fn call_mode<R, E>(
+        &self,
+        mode: rusqlite::OperationMode,
+        operation: impl FnOnce(&mut rusqlite::Connection) -> Result<R, E> + Send + 'static,
+    ) -> Result<R, Error<E>>
+    where
+        R: Send + 'static,
+        E: Send + 'static,
+    {
         let (reply, result) = oneshot::channel();
         self.sender
             .send(Message::Call(Box::new(move |db| {
-                let outcome = match db.begin_operation() {
+                let outcome = match db.begin_operation(mode) {
                     Err(error) => Err(Error::Database(error)),
                     Ok(()) => {
                         let outcome = operation(db);

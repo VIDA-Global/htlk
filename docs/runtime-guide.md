@@ -45,6 +45,15 @@ establish a trusted hard meter.
 
 ## Choose and provision storage
 
+For independent workload groups, configure one store and runtime/engine per
+SQLite file or PostgreSQL schema/database. `store::StorePartitions` checks an
+explicit host-owned partition directory. Route each tenant's atomic workload,
+idempotency keys, and referenced artifacts to the same store. A generated run ID
+identifies its home store by namespace; keep the partition alongside opaque
+wait or artifact IDs when routing by those IDs alone. `positions()` returns one
+history pin per store for paged reads, without a global commit order or a
+transaction spanning partitions.
+
 SQLite is enabled by default. `SqliteStore` is the compatible name for the shared
 store handle's `open`/`in_memory` constructors. To enable PostgreSQL through the
 facade, select its Cargo feature:
