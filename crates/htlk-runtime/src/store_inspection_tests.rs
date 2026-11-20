@@ -288,6 +288,69 @@ async fn frozen_contract(store: &Store) {
     );
 }
 
+async fn batch_abort_contract(store: &Store) {
+    let run = seed("batch-abort");
+    store.create_run(run.clone()).await.unwrap();
+    let lease = store
+        .acquire(&run.run_id, "owner".into(), 10, 100)
+        .await
+        .unwrap();
+    let before = store
+        .open_inspection_snapshot(&run.run_id, None)
+        .await
+        .unwrap();
+    let seq = before.header().sequence;
+    let first = || transition("first", vec![write("candidate", None, 1)], 11);
+    let second = |expected| transition("second", vec![write("candidate", Some(expected), 2)], 11);
+    let key = write("candidate", None, 1).key;
+    assert_eq!(
+        store
+            .commit_pure_batch(&lease, seq, 11, 50, vec![first(), second(2)], vec![])
+            .await,
+        Err(StoreError::Conflict)
+    );
+    assert_eq!(
+        store
+            .commit_pure_batch(&lease, seq, 50, 50, vec![first(), second(1)], vec![])
+            .await,
+        Err(StoreError::Deadline(FailureCode::Timeout))
+    );
+    assert_eq!(
+        store
+            .open_inspection_snapshot(&run.run_id, None)
+            .await
+            .unwrap(),
+        before
+    );
+    assert!(
+        store
+            .journal(&run.run_id, seq, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.record(&run.run_id, &key).await,
+        Err(StoreError::Missing)
+    );
+    assert_eq!(
+        store
+            .commit_pure_batch(&lease, seq, 11, 50, vec![first(), second(1)], vec![])
+            .await
+            .unwrap(),
+        seq + 2
+    );
+    let after = store
+        .open_inspection_snapshot(&run.run_id, None)
+        .await
+        .unwrap();
+    assert_eq!(after.position().number(), before.position().number() + 1);
+    assert_eq!(
+        store.inspection_record(&after, &key).await.unwrap().payload,
+        Value::Integer(2)
+    );
+}
+
 #[cfg(feature = "sqlite")]
 #[test]
 fn sqlite_frozen_snapshots_paging_filters_and_independent_changes() {
@@ -501,6 +564,12 @@ fn sqlite_initialization_is_one_boundary_and_expiry_does_not_hold_content() {
 }
 
 #[cfg(feature = "sqlite")]
+#[actix::test]
+async fn sqlite_batch_failure_rolls_back_the_whole_boundary() {
+    batch_abort_contract(&Store::in_memory(StoreConfig::default()).await.unwrap()).await;
+}
+
+#[cfg(feature = "sqlite")]
 #[test]
 fn sqlite_projection_failure_and_uncommitted_writes_publish_no_boundary() {
     actix::System::new().block_on(async {
@@ -637,6 +706,7 @@ fn postgres_historical_storage_contract() {
     let schemas=actix::System::new().block_on(async {
         let store=PostgresStore::initialize(settings.clone(),StoreConfig::default()).await.unwrap();
         frozen_contract(&store).await;
+        batch_abort_contract(&store).await;
         let run=seed("rollback");
         store.create_run(run.clone()).await.unwrap();
         let lease=store.acquire(&run.run_id,"owner".into(),0,100).await.unwrap();

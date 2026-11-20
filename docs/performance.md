@@ -264,3 +264,39 @@ diagnostic trials at different offered loads and graph sizes, not a comparison
 at equal load or a production SLO. PostgreSQL's small sample makes p99 the sample
 maximum; reducing shared publication and database round trips remains important
 for throughput on this deployment.
+
+## Write reduction campaign
+
+The mixed release workload above was repeated on each backend at each step of
+the change. Use `--suite extended --cases mixed --trials 1` for the default
+execution configuration and add `--pure-batch-steps 8` to reproduce the batched
+trial. The final test kept the offered rates, graph sizes, parked population, and
+inspection readers fixed for each backend.
+
+| Runtime change | SQLite write operations | SQLite affected rows | PostgreSQL write operations | PostgreSQL affected rows | PostgreSQL WAL |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Instrumented baseline | 74,505 | 409,429 | 5,180 | 20,886 | 19.1 MiB |
+| Read-only clock probes and ID blocks | 20,634 | 354,782 | 1,111 | 16,734 | 12.2 MiB |
+| Plus batched pure eval | 10,884 | 364,077 | 874 | 16,986 | 13.8 MiB |
+| Plus shared payloads and consolidated projections | 10,884 | 276,750 | 874 | 14,075 | 10.4 MiB |
+
+Write operations are successful calls on execution handles that affected at least
+one row, including parking, warm-up, replies and verification after engine launch.
+Affected rows are driver counts and may account for triggers differently. WAL
+is measured across the disposable PostgreSQL database for the entire process.
+The final tallies normalize to 21.3 write operations per measured SQLite run and
+36.4 per measured PostgreSQL run, down from 145.5 and 215.8. With 3,520 and 69
+authored eval occurrences respectively in the measured runs, this is 3.09 and
+12.67 operations per occurrence, down from 21.17 and 75.07. These ratios include
+the surrounding workload in the numerator; they are not isolated node costs.
+
+Shared checkpoint storage retained 18.12 MB against 25.05 MB of live and history
+payload references on SQLite, and 0.81 MB against 1.20 MB on PostgreSQL. The gap
+measures payload bytes eliminated relative to materializing each reference; it
+excludes journals, indexes, digest keys and artifacts.
+
+SQLite kept up with 40 arrivals/s in all four trials. PostgreSQL still built a
+backlog at 3 arrivals/s: the final trial completed 1.19 runs/s with 14.09 s p95,
+versus 1.26 runs/s with 14.16 s p95 at baseline. These single local trials show
+less write traffic; they do not establish a throughput improvement. Repeat with
+the intended workload and storage placement before choosing a batching limit.
