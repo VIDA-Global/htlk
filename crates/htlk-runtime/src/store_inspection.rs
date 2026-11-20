@@ -707,15 +707,25 @@ pub(crate) fn flush_projection(db: &rusqlite::Connection) -> rusqlite::Result<()
         }
     }
     for (run, keys, _) in runs {
-        db.execute(
-            "INSERT OR IGNORE INTO inspection_runs(run_id,created_position) VALUES(?1,?2)",
-            params![run, position],
-        )?;
-        let run_number: i64 = db.query_row(
-            "SELECT run_number FROM inspection_runs WHERE run_id=?1",
-            [&run],
-            |r| r.get(0),
-        )?;
+        // The publication clock excludes another publisher until commit. Resolve
+        // existing ordinals without speculative inserts or sequence allocation.
+        let run_number = db
+            .query_row(
+                "SELECT run_number FROM inspection_runs WHERE run_id=?1",
+                [&run],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?;
+        let run_number = match run_number {
+            Some(number) => number,
+            None => {
+                db.execute(
+                    "INSERT INTO inspection_runs(run_id,created_position) VALUES(?1,?2)",
+                    params![run, position],
+                )?;
+                db.last_insert_rowid()
+            }
+        };
         let sequence: i64 =
             db.query_row("SELECT sequence FROM runs WHERE run_id=?1", [&run], |r| {
                 r.get(0)
@@ -724,8 +734,14 @@ pub(crate) fn flush_projection(db: &rusqlite::Connection) -> rusqlite::Result<()
         db.execute("INSERT INTO inspection_changes(position,run_number,record_number,sequence) VALUES(?1,?2,0,?3)",params![position,run_number,sequence])?;
         for RecordKey { family, id } in keys {
             let family = family.as_str();
-            db.execute("INSERT OR IGNORE INTO inspection_record_keys(run_id,family,record_id,created_position) VALUES(?1,?2,?3,?4)",params![run,family,id,position])?;
-            let record_number:i64 = db.query_row("SELECT record_number FROM inspection_record_keys WHERE run_id=?1 AND family=?2 AND record_id=?3",params![run,family,id],|r| r.get(0))?;
+            let existing = db.query_row("SELECT record_number FROM inspection_record_keys WHERE run_id=?1 AND family=?2 AND record_id=?3",params![run,family,id],|r| r.get::<_, i64>(0)).optional()?;
+            let record_number = match existing {
+                Some(number) => number,
+                None => {
+                    db.execute("INSERT INTO inspection_record_keys(run_id,family,record_id,created_position) VALUES(?1,?2,?3,?4)",params![run,family,id,position])?;
+                    db.last_insert_rowid()
+                }
+            };
             let copied = db.execute("INSERT INTO inspection_records(record_number,position,revision,final,payload_digest) SELECT ?1,?2,revision,final,payload_digest FROM record_heads WHERE run_id=?3 AND family=?4 AND record_id=?5",params![record_number,position,run,family,id])?;
             if copied != 1 {
                 return Err(rusqlite::Error::Database);

@@ -345,10 +345,35 @@ async fn batch_abort_contract(store: &Store) {
         .await
         .unwrap();
     assert_eq!(after.position().number(), before.position().number() + 1);
+    assert_eq!(after.header().sequence, seq + 2);
+    assert_eq!(
+        store.inspection_record(&before, &key).await,
+        Err(StoreError::Missing)
+    );
+    let journal = store.journal(&run.run_id, seq, 10).await.unwrap();
+    assert_eq!(
+        journal
+            .iter()
+            .map(|event| event.command_id.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("first"), Some("second")]
+    );
+    let changes = store
+        .inspection_changes(0, Some(after.position()), 20)
+        .await
+        .unwrap();
+    let published: Vec<_> = changes
+        .iter()
+        .filter(|change| change.position == *after.position())
+        .collect();
+    assert_eq!(published.len(), 2, "one header and one final record change");
+    assert!(published.iter().all(|change| change.sequence == seq + 2));
     assert_eq!(
         store.inspection_record(&after, &key).await.unwrap().payload,
         Value::Integer(2)
     );
+    let counts = store.connection.read(move |db| db.query_row("SELECT (SELECT count(*) FROM inspection_record_keys WHERE run_id=?1),(SELECT count(*) FROM inspection_records v JOIN inspection_record_keys k USING(record_number) WHERE k.run_id=?1)", [run.run_id.as_str()], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))).await.unwrap();
+    assert_eq!(counts, (1, 1));
 }
 
 #[cfg(feature = "sqlite")]

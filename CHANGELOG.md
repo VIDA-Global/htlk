@@ -18,6 +18,9 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ### Changed
 
+- Inspection publication reuses existing run and record ordinals without
+  attempting another insertion, and publishes only the final record version per
+  physical commit.
 - PostgreSQL per-run advisory locks keep receipt-only retries from generating WAL
   or waiting for a new synchronous replication acknowledgment.
 - Current and historical records share immutable checkpoint payloads, and

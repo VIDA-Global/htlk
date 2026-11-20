@@ -360,15 +360,22 @@ impl Database {
     pub(crate) fn execute(&self, sql: &str, values: Vec<Value>) -> store_db::Result<usize> {
         self.deadline()?;
         let mut sql = dialect(sql)?;
-        let epoch = sql.starts_with("INSERT INTO mcp_epochs(");
-        if epoch {
-            sql.push_str(" RETURNING epoch");
+        let ordinal = [
+            ("INSERT INTO mcp_epochs(", "epoch"),
+            ("INSERT INTO inspection_runs(", "run_number"),
+            ("INSERT INTO inspection_record_keys(", "record_number"),
+        ]
+        .into_iter()
+        .find_map(|(prefix, field)| sql.starts_with(prefix).then_some(field));
+        if let Some(field) = ordinal {
+            sql.push_str(" RETURNING ");
+            sql.push_str(field);
         }
         let mut client = self.client.borrow_mut();
         let statement = self.prepare(&mut client, &sql)?;
         let params = parameters(statement.params(), values)?;
         let refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|v| &**v).collect();
-        if epoch {
+        if ordinal.is_some() {
             let row = client.query_one(&statement, &refs).map_err(pg_error)?;
             self.last_insert.set(row.get(0));
             self.affected_rows
