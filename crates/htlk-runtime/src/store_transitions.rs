@@ -166,6 +166,71 @@ pub struct OutboxNotice {
 }
 
 impl SqliteStore {
+    pub(crate) async fn commit_pure_batch(
+        &self,
+        lease: &RunLease,
+        sequence: i64,
+        observed: i64,
+        deadline: i64,
+        steps: Vec<Transition>,
+        blobs: Vec<crate::artifact::PreparedArtifact>,
+    ) -> Result<i64, StoreError> {
+        if !(1..=8).contains(&steps.len())
+            || steps
+                .iter()
+                .any(|step| step.next_status.is_some() || step.root.is_some())
+        {
+            return Err(StoreError::Invalid);
+        }
+        let limits = self.config.limits.clone();
+        let prepared: Vec<_> = steps
+            .into_iter()
+            .map(|step| PreparedTransition::new(lease, step, &limits))
+            .collect::<Result<_, _>>()?;
+        for blob in &blobs {
+            blob.metadata()
+                .verify_value(blob.bytes(), &limits)
+                .map_err(artifacts::artifact_error)?;
+        }
+        let lease = lease.clone();
+        self.connection
+            .write_run(lease.run_id().to_string(), move |db| {
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let header = load_header(&tx, lease.run_id())?;
+                let now = runs::observed_time(&tx, observed)?;
+                check_authority(&header, &lease, now)?;
+                if header.sequence != sequence || header.status.is_terminal() {
+                    return Err(StoreError::Conflict);
+                }
+                if now >= deadline {
+                    return Err(StoreError::Deadline(FailureCode::Timeout));
+                }
+                for blob in blobs {
+                    artifacts::stage_bytes(&tx, blob.metadata().storage_reference(), blob.bytes())?;
+                }
+                let mut sequence = sequence;
+                for mut transition in prepared {
+                    transition.transition.context.timestamp_ms =
+                        now.max(transition.transition.context.timestamp_ms);
+                    let next = sequence.checked_add(1).ok_or(StoreError::Invalid)?;
+                    let receipt = transition.apply_at_sequence(
+                        &tx,
+                        &lease,
+                        &limits,
+                        Some(sequence),
+                        false,
+                    )?;
+                    if receipt.sequence != next {
+                        return Err(StoreError::Conflict);
+                    }
+                    sequence = next;
+                }
+                tx.commit()?;
+                Ok(sequence)
+            })
+            .await
+            .map_err(StoreError::from_worker)
+    }
     /// Atomically compare/revise records, update run status/root, append the complete
     /// decision and enqueue its outbox hint. An identical command returns its old
     /// receipt; a changed request under that key fails. Timestamp and worker lease
@@ -183,7 +248,7 @@ impl SqliteStore {
         lease: &RunLease,
         transition: Transition,
     ) -> Result<CommitReceipt, StoreError> {
-        self.commit_at_sequence(lease, transition, None).await
+        self.commit_transition(lease, transition, None, false).await
     }
 
     pub(crate) async fn commit_at_sequence(
@@ -191,6 +256,17 @@ impl SqliteStore {
         lease: &RunLease,
         transition: Transition,
         sequence: Option<i64>,
+    ) -> Result<CommitReceipt, StoreError> {
+        self.commit_transition(lease, transition, sequence, true)
+            .await
+    }
+
+    async fn commit_transition(
+        &self,
+        lease: &RunLease,
+        transition: Transition,
+        sequence: Option<i64>,
+        coordinated: bool,
     ) -> Result<CommitReceipt, StoreError> {
         let limits = self.config.limits.clone();
         let prepared = PreparedTransition::new(lease, transition, &limits)?;
@@ -200,7 +276,8 @@ impl SqliteStore {
                 lease.run_id().to_string(),
                 move |db| -> Result<CommitReceipt, StoreError> {
                     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                    let receipt = prepared.apply_at_sequence(&tx, &lease, &limits, sequence)?;
+                    let receipt =
+                        prepared.apply_at_sequence(&tx, &lease, &limits, sequence, coordinated)?;
                     tx.commit()?;
                     Ok(receipt)
                 },
@@ -442,7 +519,7 @@ impl PreparedTransition {
         lease: &RunLease,
         limits: &Limits,
     ) -> Result<CommitReceipt, StoreError> {
-        self.apply_at_sequence(tx, lease, limits, None)
+        self.apply_at_sequence(tx, lease, limits, None, false)
     }
 
     fn apply_at_sequence(
@@ -451,6 +528,7 @@ impl PreparedTransition {
         lease: &RunLease,
         limits: &Limits,
         sequence: Option<i64>,
+        coordinated: bool,
     ) -> Result<CommitReceipt, StoreError> {
         let Self {
             transition,
@@ -459,7 +537,10 @@ impl PreparedTransition {
             writes,
         } = self;
         let header = load_header(tx, &lease.run_id)?;
-        let now = transition.context.timestamp_ms.max(header.last_time_ms);
+        let mut now = transition.context.timestamp_ms.max(header.last_time_ms);
+        if coordinated {
+            now = runs::observed_time(tx, now)?;
+        }
         check_authority(&header, lease, now)?;
         if sequence.is_some_and(|expected| header.sequence != expected) {
             return Err(StoreError::Conflict);
@@ -506,9 +587,7 @@ impl PreparedTransition {
                 return Err(StoreError::Conflict);
             }
             let revision = next_revision(write.expected_revision)?;
-            tx.execute("INSERT INTO records(run_id,family,record_id,revision,final,payload) VALUES(?1,?2,?3,?4,?5,?6)
-                ON CONFLICT(run_id,family,record_id) DO UPDATE SET revision=excluded.revision,final=excluded.final,payload=excluded.payload",
-                params![lease.run_id.as_str(), write.key.family.as_str(), write.key.id, revision, write.final_record, payload])?;
+            write_checkpoint(tx, &lease.run_id, write, revision, payload)?;
         }
         retention::check_references(tx, &transition.writes, limits)?;
         artifacts::check_output_publication(tx, &lease.run_id, &transition.writes, limits)?;
@@ -548,6 +627,42 @@ impl PreparedTransition {
         )?;
         Ok(CommitReceipt { sequence })
     }
+}
+
+pub(super) fn checkpoint_payload(
+    db: &rusqlite::Connection,
+    payload: &[u8],
+) -> Result<String, StoreError> {
+    let digest = htlk_executable::digest::hash_bytes(payload).to_string();
+    if db.execute(
+        "INSERT OR IGNORE INTO checkpoint_payloads(payload_digest,payload) VALUES(?1,?2)",
+        params![digest, payload],
+    )? == 0
+    {
+        let exact = db.query_row(
+            "SELECT payload=?2 FROM checkpoint_payloads WHERE payload_digest=?1",
+            params![digest, payload],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exact {
+            return Err(StoreError::Corrupt);
+        }
+    }
+    Ok(digest)
+}
+
+pub(super) fn write_checkpoint(
+    tx: &rusqlite::Transaction<'_>,
+    run: &RunId,
+    write: &RecordWrite,
+    revision: i64,
+    payload: &[u8],
+) -> Result<(), StoreError> {
+    let digest = checkpoint_payload(tx, payload)?;
+    tx.execute("INSERT INTO record_heads(run_id,family,record_id,revision,final,payload_digest) VALUES(?1,?2,?3,?4,?5,?6)
+        ON CONFLICT(run_id,family,record_id) DO UPDATE SET revision=excluded.revision,final=excluded.final,payload_digest=excluded.payload_digest",
+        params![run.as_str(), write.key.family.as_str(), write.key.id, revision, write.final_record, digest])?;
+    Ok(())
 }
 
 pub(super) fn next_revision(previous: Option<i64>) -> Result<i64, StoreError> {

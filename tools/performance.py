@@ -214,6 +214,7 @@ def main():
     parser.add_argument("--cases", help="optional comma-separated subset of cases")
     parser.add_argument("--runs", type=int, help="override measured run count per selected trial")
     parser.add_argument("--trials", type=int, default=3)
+    parser.add_argument("--pure-batch-steps", type=int, choices=range(1, 9))
     parser.add_argument("--postgres-container", help="dedicated local container for optional database/WAL statistics")
     parser.add_argument("--postgres-database", default="htlk_perf")
     parser.add_argument("--postgres-statements", action="store_true",
@@ -235,6 +236,9 @@ def main():
         parser.error("select existing cases for the specified backend and suite")
     if args.runs is not None:
         grid = [(backend, name, spec | {"runs": args.runs} if spec["runs"] else spec)
+                for backend, name, spec in grid]
+    if args.pure_batch_steps is not None:
+        grid = [(backend, name, spec | {"pure_batch_steps": args.pure_batch_steps})
                 for backend, name, spec in grid]
     args.output.mkdir()  # Refuse to mix results with any previous campaign.
     with args.binary.open("rb") as binary:

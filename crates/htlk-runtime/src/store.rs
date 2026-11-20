@@ -16,7 +16,7 @@ use htlk_executable::{
 };
 use std::{fmt, path::Path, time::Duration};
 
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 const APPLICATION_ID: i64 = 0x48544c4b;
 const SCHEMA: &str = include_str!("store.sql");
 const REGISTRATION_SCHEMA: &str = include_str!("store_registration.sql");
@@ -31,6 +31,9 @@ const MCP_REMOTE_TASKS_SCHEMA: &str = include_str!("store_mcp_remote_tasks.sql")
 const INSPECTION_SCHEMA: &str = include_str!("store_inspection.sql");
 #[path = "store_inspection.rs"]
 mod inspection;
+pub(crate) use inspection::ProjectionBatch;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) use inspection::flush_projection;
 pub use inspection::{
     HistoricalRecord, InspectionArtifactState, InspectionChange, InspectionRunFilter,
     InspectionRunPage, InspectionSnapshot, StorePosition,
@@ -101,12 +104,25 @@ impl Default for StoreConfig {
 pub struct Store {
     pub(crate) connection: Connection,
     pub(crate) config: StoreConfig,
+    pub(crate) run_ids: std::sync::Arc<tokio::sync::Mutex<Option<runs::RunIdBlock>>>,
 }
 /// Compatibility name for the store's SQLite constructors.
 ///
 /// Existing hosts can keep using `SqliteStore::open` and `SqliteStore::in_memory`.
 /// Runtime consumers use [`Store`] without coupling execution to a database driver.
 pub type SqliteStore = Store;
+
+/// Advisory counters for successful, row-changing storage operations on one
+/// connection. Read transactions and operations reporting an error are excluded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreWriteMetrics {
+    /// Acknowledged worker calls that affected one or more rows. A call may
+    /// contain multiple logical transitions.
+    pub operations: u64,
+    /// Driver-reported affected rows in those calls. Trigger and savepoint
+    /// accounting can vary by backend; this is not a count of disk writes.
+    pub rows: u64,
+}
 
 #[cfg(feature = "postgres")]
 pub use crate::store_postgres::{PostgresConfig, PostgresStore};
@@ -186,11 +202,24 @@ impl Store {
             })
             .await
             .map_err(StoreError::from_worker)?;
-        Ok(Self { connection, config })
+        Ok(Self::from_connection(connection, config))
+    }
+    pub(crate) fn from_connection(connection: Connection, config: StoreConfig) -> Self {
+        Self {
+            connection,
+            config,
+            run_ids: Default::default(),
+        }
     }
     /// Returns the host-selected bounded database settings.
     pub fn config(&self) -> &StoreConfig {
         &self.config
+    }
+    /// Samples connection-local, cumulative write counters. Clones share the
+    /// counters; independently opened connections report separately. Sample at
+    /// quiescence for a consistent operation/row pair.
+    pub fn write_metrics(&self) -> StoreWriteMetrics {
+        self.connection.write_metrics()
     }
     /// Closes this connection and its clones after queued operations finish.
     /// Separately opened database connections remain usable.
@@ -1157,7 +1186,7 @@ mod tests {
                 .connection
                 .call(|db| {
                     db.execute(
-                        "UPDATE records SET payload=x'ff' WHERE record_id='node'",
+                        "UPDATE checkpoint_payloads SET payload=x'ff' WHERE payload_digest IN (SELECT payload_digest FROM record_heads WHERE record_id='node')",
                         [],
                     )
                 })

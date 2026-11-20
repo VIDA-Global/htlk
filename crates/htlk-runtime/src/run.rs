@@ -91,7 +91,7 @@ impl Runtime {
             .map_err(|_| RuntimeError::failure(FailureCode::Input))?,
         };
         request.check(&self.config.limits)?;
-        let now = self.store.coordinator_time(self.clock.now_ms()?).await?;
+        let now = self.clock.now_ms()?;
         if let Some(run_id) = self.store.host_receipt(&request, now).await? {
             return Ok(RunStarted { run_id });
         }
@@ -336,7 +336,7 @@ impl Runtime {
             audit_retention_ms: self.config.audit_retention_ms as i64,
             limits: self.config.limits.clone(),
         };
-        let observed = self.clock.now_ms()?;
+        let observed = self.clock.now_ms()?.max(now);
         let run_id = self
             .store
             .initialize_run(

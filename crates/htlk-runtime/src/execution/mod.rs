@@ -68,6 +68,9 @@ pub struct ExecutionConfig {
     pub lease_ms: i64,
     /// Scheduling/recovery polling interval.
     pub poll_interval: Duration,
+    /// Maximum logical decisions committed together per pure eval invocation.
+    /// One preserves independently pinnable transitions; two through eight opt in.
+    pub pure_batch_steps: usize,
 }
 impl Default for ExecutionConfig {
     fn default() -> Self {
@@ -78,6 +81,7 @@ impl Default for ExecutionConfig {
             max_runs: 64,
             lease_ms: 30000,
             poll_interval: Duration::from_millis(20),
+            pure_batch_steps: 1,
         }
     }
 }
@@ -105,6 +109,7 @@ impl ExecutionEngine {
             || config.lease_ms < 100
             || config.poll_interval.is_zero()
             || config.poll_interval > Duration::from_secs(10)
+            || !(1..=8).contains(&config.pure_batch_steps)
         {
             return Err(RuntimeError::failure(FailureCode::Profile));
         }
@@ -173,6 +178,7 @@ struct Work {
     runtime: Arc<Runtime>,
     lease: RunLease,
     recovering: bool,
+    pure_batch_steps: usize,
     working: working::Slot,
 }
 impl Message for Work {
@@ -187,7 +193,7 @@ impl Handler<Work> for Worker {
         let cell = std::cell::RefCell::new(msg.working);
         let mut run = Box::pin(working::WORKING.scope(
             cell,
-            recovery::drive(msg.runtime, msg.lease, msg.recovering),
+            recovery::drive(msg.runtime, msg.lease, msg.recovering, msg.pure_batch_steps),
         ));
         let result = System::new().block_on(run.as_mut());
         let cache = run
@@ -523,6 +529,7 @@ impl Handler<Pulse> for Coordinator {
                     runtime: self.runtime.clone(),
                     lease,
                     recovering: !self.state.is_recovered(),
+                    pure_batch_steps: self.config.pure_batch_steps,
                     working: self.working.take(),
                 })
                 .into_actor(self)

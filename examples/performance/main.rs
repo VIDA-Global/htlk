@@ -47,6 +47,7 @@ const HELP: &str =
   [--concurrency 16 | --rate 0] [--timeout-s 300] [--micro-samples 30]
   [--history-samples 20] [--readers 0] [--recovery-samples 0] [--cache 16] [--work-dir target]
   [--mix-nodes 0] [--parked-runs 0] adds deep/wide runs and a parked population to a one-node chain.
+  [--pure-batch-steps 1] sets the opt-in eval batch limit (1–8).
   [--runs 0 --idle-ms 5000] measures an empty engine with no completion reader.
   PostgreSQL requires HTLK_PERF_POSTGRES_URL for a disposable database.";
 
@@ -68,6 +69,7 @@ struct Config {
     readers: usize,
     recovery_samples: usize,
     mix_nodes: usize,
+    pure_batch_steps: usize,
     parked_runs: usize,
     idle_ms: u64,
     cache: usize,
@@ -117,6 +119,7 @@ impl Config {
             readers: get("--readers", "0").parse()?,
             recovery_samples: get("--recovery-samples", "0").parse()?,
             mix_nodes: get("--mix-nodes", "0").parse()?,
+            pure_batch_steps: get("--pure-batch-steps", "1").parse()?,
             parked_runs: get("--parked-runs", "0").parse()?,
             idle_ms: get("--idle-ms", "0").parse()?,
             cache: get("--cache", "16").parse()?,
@@ -144,6 +147,7 @@ impl Config {
             || config.cache > 1024
             || config.recovery_samples > 30
             || config.mix_nodes > 64
+            || !(1..=8).contains(&config.pure_batch_steps)
             || config.parked_runs > 4096
             || (config.parked_runs > 0 && config.mix_nodes == 0)
             || (config.mix_nodes > 0 && (!config.workload.is_short_chain() || config.runs == 0))
@@ -506,6 +510,7 @@ async fn measure(config: Config) -> Result<()> {
     let engine_config = ExecutionConfig {
         workers: config.workers,
         max_runs: config.max_runs,
+        pure_batch_steps: config.pure_batch_steps,
         poll_interval: Duration::from_millis(config.poll_ms),
         ..Default::default()
     };
@@ -612,6 +617,7 @@ async fn measure(config: Config) -> Result<()> {
             engine_config.clone(),
         )?);
     }
+    let before: Vec<_> = stores.iter().map(Store::write_metrics).collect();
     let parked = if let Some((work, fingerprint)) = parked_graph {
         mixed::park(
             &runtimes[0],
@@ -741,10 +747,19 @@ async fn measure(config: Config) -> Result<()> {
     if config.recovery_samples > 0 {
         recovery::samples(&database, &reader, registry, &config, graph.fingerprint).await?;
     }
+    let (stored_payload, referenced_payload) = reader.checkpoint_payload_bytes().await?;
+    println!("metadata,checkpoint_stored_bytes,{stored_payload}");
+    println!("metadata,checkpoint_referenced_bytes,{referenced_payload}");
     reader.close().await?;
-    for store in stores {
-        store.close().await?;
+    let (mut write_operations, mut affected_rows) = (0, 0);
+    for (store, before) in stores.into_iter().zip(before) {
+        store.clone().close().await?;
+        let after = store.write_metrics();
+        write_operations += after.operations - before.operations;
+        affected_rows += after.rows - before.rows;
     }
+    println!("metadata,write_operations,{write_operations}");
+    println!("metadata,affected_rows,{affected_rows}");
     if let (Some(before), Some(after)) = (initial_bytes, database.sqlite_bytes()?) {
         println!(
             "metadata,sqlite_growth_bytes,{}",

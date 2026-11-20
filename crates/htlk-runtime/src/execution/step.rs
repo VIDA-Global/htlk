@@ -48,10 +48,15 @@ pub(super) enum Progress {
     Quiescent { sequence: i64, wake_at: i64 },
     Terminal,
 }
-pub(super) async fn tick(runtime: Arc<Runtime>, lease: RunLease) -> Result<Progress, RuntimeError> {
+pub(super) async fn tick(
+    runtime: Arc<Runtime>,
+    lease: RunLease,
+    pure_batch_steps: usize,
+) -> Result<Progress, RuntimeError> {
     tick_observed(
         runtime,
         lease,
+        pure_batch_steps,
         #[cfg(all(test, feature = "sqlite"))]
         None,
     )
@@ -60,6 +65,7 @@ pub(super) async fn tick(runtime: Arc<Runtime>, lease: RunLease) -> Result<Progr
 async fn tick_observed(
     runtime: Arc<Runtime>,
     lease: RunLease,
+    pure_batch_steps: usize,
     #[cfg(all(test, feature = "sqlite"))] probe: Option<&tests::Probe>,
 ) -> Result<Progress, RuntimeError> {
     let cached_sequence =
@@ -254,6 +260,23 @@ async fn tick_observed(
             if working::with(|set| set.waiting(&record.key.id)) == Some(true) {
                 continue;
             }
+            if pure_batch_steps > 1 && matches!(definition.fields().operation, Operation::Eval(_)) {
+                match batch_eval(
+                    &runtime,
+                    &lease,
+                    &scope,
+                    definition,
+                    record,
+                    header.sequence,
+                    pure_batch_steps,
+                )
+                .await?
+                {
+                    Some(true) => return Ok(Progress::Changed),
+                    Some(false) => continue,
+                    None => {} // An oversized proposal uses the ordinary single-step path.
+                }
+            }
             let changed =
                 if InvocationCheckpoint::parse(record, &runtime.config.limits)?.is_pending() {
                     admit(&runtime, &lease, &scope, definition, record).await?
@@ -323,12 +346,153 @@ pub(super) async fn commit(
     writes: Vec<RecordWrite>,
     status: Option<RunStatus>,
 ) -> Result<(), RuntimeError> {
-    let now = runtime
+    let now = runtime.clock.now_ms()?;
+    let transition = Transition {
+        context: TransitionContext {
+            command_id: command,
+            actor: lease.owner().into(),
+            causation: "execution".into(),
+            timestamp_ms: now,
+        },
+        writes,
+        next_status: status,
+        root: None,
+        expected_fingerprint: None,
+    };
+    if PURE_DRAFT.try_with(|_| ()).is_ok() {
+        return PURE_DRAFT
+            .with(|draft| draft.borrow_mut().push(transition, &runtime.config.limits));
+    }
+    commit_one(runtime, lease, transition).await
+}
+
+#[derive(Default)]
+struct PureDraft {
+    steps: Vec<Transition>,
+    blobs: Vec<PreparedArtifact>,
+    bytes: usize,
+    oversize: bool,
+}
+tokio::task_local! { static PURE_DRAFT: std::cell::RefCell<PureDraft>; }
+
+impl PureDraft {
+    fn charge(&mut self, bytes: usize) -> Result<(), RuntimeError> {
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.bytes > 1024 * 1024 {
+            self.oversize = true;
+            return Err(StoreError::Invalid.into());
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, transition: Transition, limits: &cbor::Limits) -> Result<(), RuntimeError> {
+        for write in &transition.writes {
+            self.charge(
+                cbor::encode(&write.payload, limits)?
+                    .len()
+                    .saturating_add(write.key.id.len())
+                    .saturating_add(128),
+            )?;
+        }
+        self.steps.push(transition);
+        Ok(())
+    }
+
+    fn stage(&mut self, artifact: PreparedArtifact) -> Result<(), RuntimeError> {
+        self.charge(artifact.bytes().len())?;
+        self.blobs.push(artifact);
+        Ok(())
+    }
+
+    fn record(&self, key: &crate::store::RecordKey) -> Option<StoredRecord> {
+        let write = self
+            .steps
+            .iter()
+            .rev()
+            .flat_map(|step| &step.writes)
+            .find(|write| &write.key == key)?;
+        Some(StoredRecord {
+            key: key.clone(),
+            revision: write.expected_revision.unwrap_or(0).checked_add(1)?,
+            final_record: write.final_record,
+            payload: write.payload.clone(),
+        })
+    }
+}
+
+async fn batch_eval(
+    runtime: &Arc<Runtime>,
+    lease: &RunLease,
+    scope: &ScopeState,
+    node: &Node,
+    record: &StoredRecord,
+    sequence: i64,
+    limit: usize,
+) -> Result<Option<bool>, RuntimeError> {
+    let mut plan = Box::pin(PURE_DRAFT.scope(Default::default(), async {
+        let mut record = record.clone();
+        for _ in 0..limit {
+            let pending =
+                InvocationCheckpoint::parse(&record, &runtime.config.limits)?.is_pending();
+            let changed = if pending {
+                admit(runtime, lease, scope, node, &record).await?
+            } else {
+                operate(runtime, lease, scope, node, &record).await?
+            };
+            if !changed || !pending {
+                break;
+            }
+            if let Some(proposed) = PURE_DRAFT.with(|draft| draft.borrow().record(&record.key)) {
+                record = proposed;
+                if record.final_record {
+                    break;
+                }
+            }
+        }
+        Ok::<_, RuntimeError>(())
+    }));
+    let result = plan.as_mut().await;
+    let draft = plan.as_mut().take_value().ok_or_else(err)?.into_inner();
+    if draft.oversize {
+        return Ok(None);
+    }
+    result?;
+    if draft.steps.is_empty() {
+        return Ok(Some(false));
+    }
+    let observed = runtime.clock.now_ms()?.max(
+        draft
+            .steps
+            .iter()
+            .map(|step| step.context.timestamp_ms)
+            .max()
+            .ok_or_else(err)?,
+    );
+    let deadline = number(&scope.record.payload, "deadline_ms")?;
+    runtime
         .store
-        .coordinator_time(runtime.clock.now_ms()?)
+        .commit_pure_batch(
+            lease,
+            sequence,
+            observed,
+            deadline,
+            draft.steps,
+            draft.blobs,
+        )
         .await?;
+    // Reload if another operation changed the run after the batch began. The
+    // durable sequence is also checked by every later scheduling observation.
+    Ok(Some(true))
+}
+
+async fn commit_one(
+    runtime: &Runtime,
+    lease: &RunLease,
+    transition: Transition,
+) -> Result<(), RuntimeError> {
     let retained = working::with(|_| {
-        writes
+        transition
+            .writes
             .iter()
             .filter(|write| {
                 matches!(
@@ -342,22 +506,7 @@ pub(super) async fn commit(
     let sequence = working::with(|set| set.sequence).filter(|sequence| *sequence > 0);
     let receipt = runtime
         .store
-        .commit_at_sequence(
-            lease,
-            Transition {
-                context: TransitionContext {
-                    command_id: command,
-                    actor: lease.owner().into(),
-                    causation: "execution".into(),
-                    timestamp_ms: now,
-                },
-                writes,
-                next_status: status,
-                root: None,
-                expected_fingerprint: None,
-            },
-            sequence,
-        )
+        .commit_at_sequence(lease, transition, sequence)
         .await?;
     if let Some(retained) = retained {
         working::with(|set| set.committed(receipt.sequence, retained, &runtime.config.limits));
@@ -370,6 +519,9 @@ async fn scheduling_record(
     lease: &RunLease,
     key: &crate::store::RecordKey,
 ) -> Result<StoredRecord, StoreError> {
+    if let Ok(Some(record)) = PURE_DRAFT.try_with(|draft| draft.borrow().record(key)) {
+        return Ok(record);
+    }
     if let Some(record) = working::with(|set| set.get(key)).flatten() {
         return Ok(record);
     }
@@ -735,7 +887,9 @@ async fn admit(
                         && let Some(producer) = scope.nodes.get(producer)
                         && !producer.final_record
                     {
-                        working::with(|set| set.defer(&record.key.id, &producer.key.id));
+                        if PURE_DRAFT.try_with(|_| ()).is_err() {
+                            working::with(|set| set.defer(&record.key.id, &producer.key.id));
+                        }
                         break;
                     }
                 }
@@ -1344,7 +1498,6 @@ pub(super) async fn accept_node(
             },
             &runtime.config.limits,
         )?;
-        runtime.store.stage_artifact(&artifact).await?;
         let port = match artifact.metadata().producer() {
             ArtifactProducer::NodeOutput { port, .. } => port.to_string(),
             _ => return Err(err()),
@@ -1356,6 +1509,11 @@ pub(super) async fn accept_node(
             artifact.metadata().to_value(&runtime.config.limits)?,
             true,
         ));
+        if PURE_DRAFT.try_with(|_| ()).is_ok() {
+            PURE_DRAFT.with(|draft| draft.borrow_mut().stage(artifact))?;
+        } else {
+            runtime.store.stage_artifact(&artifact).await?;
+        }
     }
     for (port, value) in outputs {
         if entry(&value)?.is_none() {

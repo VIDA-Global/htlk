@@ -211,7 +211,7 @@ async fn waiting_run() -> (Arc<Runtime>, HostContext, RunLease, WaitId) {
         .await
         .unwrap();
     for _ in 0..32 {
-        match tick(runtime.clone(), lease.clone()).await.unwrap() {
+        match tick(runtime.clone(), lease.clone(), 1).await.unwrap() {
             Progress::Changed => {}
             Progress::Blocked | Progress::Quiescent { .. } => {
                 let waits = super::super::control::all(&runtime, &lease, RecordFamily::Wait)
@@ -435,7 +435,7 @@ fn host_reply_during_external_work_scans_invalidates_the_entire_progress_observa
             // Timeout is only a watchdog; Notify establishes the interleaving.
             let (progress, ()) = tokio::time::timeout(Duration::from_secs(30), async {
                 tokio::join!(
-                    tick_observed(runtime.clone(), lease.clone(), Some(&probe)),
+                    tick_observed(runtime.clone(), lease.clone(), 1, Some(&probe)),
                     async {
                         probe.reached.notified().await;
                         assert_eq!(
@@ -470,7 +470,7 @@ fn host_reply_during_external_work_scans_invalidates_the_entire_progress_observa
             assert!(runtime.quiescent.lock().unwrap().is_empty());
             for _ in 0..32 {
                 if matches!(
-                    recovery::drive(runtime.clone(), lease.clone(), false)
+                    recovery::drive(runtime.clone(), lease.clone(), false, 1)
                         .await
                         .unwrap(),
                     Progress::Terminal
@@ -530,7 +530,7 @@ fn stable_open_wait_blocks_but_stable_impossible_wait_state_still_fails_invarian
         let (runtime, _, lease, wait) = waiting_run().await;
         let before = runtime.store.run_header(lease.run_id()).await.unwrap();
         assert!(matches!(
-            tick(runtime.clone(), lease.clone()).await.unwrap(),
+            tick(runtime.clone(), lease.clone(), 1).await.unwrap(),
             Progress::Quiescent { .. }
         ));
         assert_eq!(
@@ -563,7 +563,7 @@ fn stable_open_wait_blocks_but_stable_impossible_wait_state_still_fails_invarian
         .unwrap();
         let stable = runtime.store.run_header(lease.run_id()).await.unwrap();
         assert_eq!(
-            tick(runtime.clone(), lease.clone())
+            tick(runtime.clone(), lease.clone(), 1)
                 .await
                 .err()
                 .unwrap()
@@ -575,7 +575,7 @@ fn stable_open_wait_blocks_but_stable_impossible_wait_state_still_fails_invarian
             stable
         );
         assert!(matches!(
-            recovery::drive(runtime.clone(), lease.clone(), false)
+            recovery::drive(runtime.clone(), lease.clone(), false, 1)
                 .await
                 .unwrap(),
             Progress::Terminal
@@ -611,7 +611,7 @@ fn due_node_and_run_deadlines_are_progress_not_quiescence_or_invariant_failures(
             if now == 1500 {
                 // The node deadline is due before its enclosing scope deadline.
                 assert!(matches!(
-                    tick(runtime.clone(), lease.clone()).await.unwrap(),
+                    tick(runtime.clone(), lease.clone(), 1).await.unwrap(),
                     Progress::Changed
                 ));
                 let invocation =

@@ -8,11 +8,22 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ### Added
 
+- Opt-in bounded pure-eval batching. Logical decisions remain in the journal;
+  one inspection pin represents the batch's committed state.
+- Per-connection write-operation and affected-row counters for performance campaigns.
 - Repeatable release-mode performance campaigns for durable SQLite and PostgreSQL,
   with raw timing samples and correctness checks under load.
 
 ### Changed
 
+- PostgreSQL per-run advisory locks keep receipt-only retries from generating WAL
+  or waiting for a new synchronous replication acknowledgment.
+- Current and historical records share immutable checkpoint payloads, and
+  historical projections publish once per physical commit. This changes native
+  identities and requires SQLite layout 17 or PostgreSQL layout 4.
+- Scheduling time probes and host receipt lookups are read-only. Run-ID
+  allocation reserves durable blocks, and execution commits normalize time in
+  the accepting transaction.
 - PostgreSQL scheduling and historical reads use ungated repeatable-read snapshots.
   Ordinary single-run writes coordinate on the run row and order publication at
   the inspection clock. Hosts can route independent SQLite or PostgreSQL stores

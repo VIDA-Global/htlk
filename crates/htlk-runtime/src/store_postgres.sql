@@ -1,4 +1,4 @@
--- Native PostgreSQL layout 3. Canonical CBOR remains authoritative.
+-- Native PostgreSQL layout 4. Canonical CBOR remains authoritative.
 -- Arbitrary UTF-8 identities are BYTEA (including NUL). Generated SHA-256 keys
 -- bound B-tree entries without narrowing admitted identity sizes. The preimage
 -- registry rejects collisions before any ON CONFLICT operation can conflate keys.
@@ -87,7 +87,8 @@ CREATE TABLE outbox (
 CREATE TRIGGER outbox_keys BEFORE INSERT OR UPDATE OF run_id ON outbox
     FOR EACH ROW EXECUTE FUNCTION htlk_check_keys('run_id');
 CREATE INDEX outbox_pending ON outbox(delivered,run_key,sequence);
-CREATE TABLE records (
+CREATE TABLE checkpoint_payloads (payload_digest TEXT PRIMARY KEY, payload BYTEA NOT NULL);
+CREATE TABLE record_heads (
     run_id BYTEA NOT NULL,
     run_key BYTEA GENERATED ALWAYS AS (sha256(run_id)) STORED REFERENCES runs(run_key),
     family TEXT NOT NULL,
@@ -95,10 +96,10 @@ CREATE TABLE records (
     record_key BYTEA GENERATED ALWAYS AS (sha256(record_id)) STORED,
     revision BIGINT NOT NULL CHECK(revision>=1),
     final BIGINT NOT NULL CHECK(final IN (0,1)),
-    payload BYTEA NOT NULL,
+    payload_digest TEXT NOT NULL REFERENCES checkpoint_payloads(payload_digest),
     PRIMARY KEY(run_key,family,record_key)
 );
-CREATE TRIGGER records_keys BEFORE INSERT OR UPDATE OF run_id,record_id ON records
+CREATE TRIGGER records_keys BEFORE INSERT OR UPDATE OF run_id,record_id ON record_heads
     FOR EACH ROW EXECUTE FUNCTION htlk_check_keys('run_id','record_id');
 
 -- Journal-transaction historical projections; never recovery authority or a
@@ -150,7 +151,7 @@ CREATE TABLE inspection_records (
     position BIGINT NOT NULL,
     revision BIGINT NOT NULL,
     final BIGINT NOT NULL,
-    payload BYTEA NOT NULL,
+    payload_digest TEXT NOT NULL REFERENCES checkpoint_payloads(payload_digest),
     PRIMARY KEY(record_number,position)
 );
 CREATE TABLE inspection_changes (
@@ -161,8 +162,11 @@ CREATE TABLE inspection_changes (
     sequence BIGINT NOT NULL,
     UNIQUE(position,run_number,record_number)
 );
-CREATE UNIQUE INDEX accepted_artifact_identity ON records(record_key) WHERE family='artifact';
-CREATE INDEX records_by_identity ON records(family,record_key);
+CREATE UNIQUE INDEX accepted_artifact_identity ON record_heads(record_key) WHERE family='artifact';
+CREATE INDEX records_by_identity ON record_heads(family,record_key);
+CREATE VIEW records AS
+    SELECT h.run_id,h.run_key,h.family,h.record_id,h.record_key,h.revision,h.final,p.payload,h.payload_digest
+    FROM record_heads h LEFT JOIN checkpoint_payloads p USING(payload_digest);
 CREATE TABLE commands (
     run_id BYTEA NOT NULL,
     run_key BYTEA GENERATED ALWAYS AS (sha256(run_id)) STORED,
@@ -201,7 +205,7 @@ CREATE TABLE artifact_producers (
     run_key BYTEA GENERATED ALWAYS AS (sha256(run_id)) STORED,
     family TEXT NOT NULL DEFAULT 'artifact' CHECK(family='artifact'),
     PRIMARY KEY(producer_kind,producer_key,extension_number,port_key),
-    FOREIGN KEY(run_key,family,artifact_key) REFERENCES records(run_key,family,record_key)
+    FOREIGN KEY(run_key,family,artifact_key) REFERENCES record_heads(run_key,family,record_key)
         DEFERRABLE INITIALLY DEFERRED
 );
 CREATE TRIGGER producers_keys BEFORE INSERT OR UPDATE OF producer_id,port,run_id ON artifact_producers

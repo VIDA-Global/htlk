@@ -52,7 +52,7 @@ impl SqliteStore {
             let mut transition=Transition{context:TransitionContext{command_id:id.to_string(),actor:actor.clone(),causation:"expire_artifact".into(),timestamp_ms:now},writes:vec![write],next_status:None,root:None,expected_fingerprint:None};
             let event=cbor::encode(&transitions::transition_body(&mut transition,&limits)?,&limits)?;
             let sequence=header.sequence.checked_add(1).ok_or(StoreError::Invalid)?;
-            tx.execute("INSERT INTO records(run_id,family,record_id,revision,final,payload) VALUES(?1,'tombstone',?2,1,1,?3)",params![run.as_str(),id.to_string(),cbor::encode(&payload,&limits)?])?;
+            transitions::write_checkpoint(&tx, &run, &transition.writes[0], 1, &cbor::encode(&payload,&limits)?)?;
             tx.execute("UPDATE runs SET sequence=?2,last_time_ms=?3 WHERE run_id=?1",params![run.as_str(),sequence,now])?;
             append_event(&tx,run.as_str(),sequence,EventMeta{kind:"artifact_expired",actor:&actor,timestamp:now,causation:"expire_artifact",command:Some(&id.to_string())},&event,&limits)?;
             tx.commit()?;Ok(RetentionDisposition::Expired{at_ms:now})

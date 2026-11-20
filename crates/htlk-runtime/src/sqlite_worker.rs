@@ -5,8 +5,16 @@
 //! Database transactions, not this queue, arbitrate independent store connections.
 //! The bounded queue admits at most 256 waiting operations per shared handle.
 
+use crate::store::StoreWriteMetrics;
 use crate::store_db as rusqlite;
-use std::{path::Path, thread};
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread,
+};
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug)]
@@ -27,6 +35,13 @@ enum Message {
 #[derive(Clone)]
 pub(crate) struct Connection {
     sender: mpsc::Sender<Message>,
+    writes: Arc<WriteMetrics>,
+}
+
+#[derive(Default)]
+struct WriteMetrics {
+    operations: AtomicU64,
+    rows: AtomicU64,
 }
 
 impl Connection {
@@ -78,7 +93,17 @@ impl Connection {
             .await
             .map_err(|_| Error::Closed)?
             .map_err(Error::Error)?;
-        Ok(Self { sender })
+        Ok(Self {
+            sender,
+            writes: Arc::default(),
+        })
+    }
+
+    pub(crate) fn write_metrics(&self) -> StoreWriteMetrics {
+        StoreWriteMetrics {
+            operations: self.writes.operations.load(Ordering::Relaxed),
+            rows: self.writes.rows.load(Ordering::Relaxed),
+        }
     }
 
     pub(crate) async fn call<R, E>(
@@ -128,15 +153,24 @@ impl Connection {
         E: Send + 'static,
     {
         let (reply, result) = oneshot::channel();
+        let writes = self.writes.clone();
         self.sender
             .send(Message::Call(Box::new(move |db| {
                 let outcome = match db.begin_operation(mode) {
                     Err(error) => Err(Error::Database(error)),
                     Ok(()) => {
+                        let before = db.affected_rows();
                         let outcome = operation(db);
                         match db.finish_operation(outcome.is_ok()) {
                             Err(error) => Err(Error::Database(error)),
-                            Ok(()) => outcome.map_err(Error::Error),
+                            Ok(()) => {
+                                let rows = db.affected_rows().saturating_sub(before);
+                                if outcome.is_ok() && rows > 0 {
+                                    writes.operations.fetch_add(1, Ordering::Relaxed);
+                                    writes.rows.fetch_add(rows, Ordering::Relaxed);
+                                }
+                                outcome.map_err(Error::Error)
+                            }
                         }
                     }
                 };

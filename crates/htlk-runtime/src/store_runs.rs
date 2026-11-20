@@ -9,49 +9,64 @@ pub(crate) struct HostRequest {
     pub key: String,
     pub digest: Digest,
 }
+pub(crate) struct RunIdBlock {
+    namespace: String,
+    remaining: std::ops::RangeInclusive<i64>,
+}
 impl SqliteStore {
     pub(crate) async fn coordinator_time(&self, observed: i64) -> Result<i64, StoreError> {
         timestamp(observed)?;
         self.connection
-            .call(move |db| -> Result<i64, StoreError> {
-                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let now = normalize_time(&tx, observed)?;
-                tx.commit()?;
-                Ok(now)
-            })
+            .read(move |db| observed_time(db, observed))
             .await
             .map_err(StoreError::from_worker)
     }
     pub(crate) async fn reserve_run_id(&self) -> Result<RunId, StoreError> {
-        let limits = self.config.limits.clone();
-        self.connection
-            .call(move |db| -> Result<RunId, StoreError> {
-                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let (namespace, previous) = tx.query_row(
-                    "SELECT namespace,next_run FROM runtime_identity WHERE singleton=1",
-                    [],
-                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
-                )?;
-                if namespace.len() != 32
-                    || !namespace
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                    || previous < 0
-                {
-                    return Err(StoreError::Corrupt);
-                }
-                let next = previous.checked_add(1).ok_or(StoreError::Invalid)?;
-                let id = RunId::new(format!("run:{namespace}:{next}"), &limits)
-                    .map_err(|_| StoreError::Invalid)?;
-                tx.execute(
-                    "UPDATE runtime_identity SET next_run=?1 WHERE singleton=1",
-                    [next],
-                )?;
-                tx.commit()?;
-                Ok(id)
-            })
-            .await
-            .map_err(StoreError::from_worker)
+        let mut block = self.run_ids.lock().await;
+        if block
+            .as_ref()
+            .is_none_or(|block| block.remaining.is_empty())
+        {
+            *block = Some(
+                self.connection
+                    .call(move |db| -> Result<RunIdBlock, StoreError> {
+                        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                        let (namespace, previous) = tx.query_row(
+                            "SELECT namespace,next_run FROM runtime_identity WHERE singleton=1",
+                            [],
+                            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                        )?;
+                        if namespace.len() != 32
+                            || !namespace
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                            || previous < 0
+                        {
+                            return Err(StoreError::Corrupt);
+                        }
+                        let next = previous.checked_add(1).ok_or(StoreError::Invalid)?;
+                        let end = previous.saturating_add(64);
+                        tx.execute(
+                            "UPDATE runtime_identity SET next_run=?1 WHERE singleton=1",
+                            [end],
+                        )?;
+                        tx.commit()?;
+                        Ok(RunIdBlock {
+                            namespace,
+                            remaining: next..=end,
+                        })
+                    })
+                    .await
+                    .map_err(StoreError::from_worker)?,
+            );
+        }
+        let block = block.as_mut().ok_or(StoreError::Corrupt)?;
+        let next = block.remaining.next().ok_or(StoreError::Corrupt)?;
+        RunId::new(
+            format!("run:{}:{next}", block.namespace),
+            &self.config.limits,
+        )
+        .map_err(|_| StoreError::Invalid)
     }
     pub(crate) async fn host_receipt(
         &self,
@@ -62,9 +77,9 @@ impl SqliteStore {
         let request = request.owned();
         let limits = self.config.limits.clone();
         self.connection
-            .call(move |db| -> Result<Option<RunId>, StoreError> {
-                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let now = normalize_time(&tx, observed)?;
+            .read(move |db| -> Result<Option<RunId>, StoreError> {
+                let tx = db.transaction()?;
+                let now = observed_time(&tx, observed)?;
                 let receipt = receipt(&tx, &request, now, &limits)?;
                 tx.commit()?;
                 Ok(receipt)
@@ -83,7 +98,7 @@ impl SqliteStore {
         let limits = self.config.limits.clone();
         self.connection.call(move|db|->Result<RunId,StoreError>{
             let tx=db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let now=normalize_time(&tx,observed)?;
+            let now=observed_time(&tx,observed)?;
             if let Some(old)=receipt(&tx,&request,now,&limits)?{tx.commit()?;return Ok(old)}
             let expires=now.checked_add(retention).ok_or(StoreError::Invalid)?;
             if retention<=0{return Err(StoreError::Invalid)}
@@ -102,7 +117,7 @@ impl SqliteStore {
                 if write.expected_revision.is_some(){return Err(StoreError::Invalid)}
                 artifacts::check_artifact_write(&tx,&prepared.run_id,write,&limits)?;
                 let payload=cbor::encode(&write.payload,&limits)?;
-                tx.execute("INSERT INTO records(run_id,family,record_id,revision,final,payload) VALUES(?1,?2,?3,1,?4,?5)",params![prepared.run_id.as_str(),write.key.family.as_str(),write.key.id,write.final_record,payload])?;
+                transitions::write_checkpoint(&tx, &prepared.run_id, write, 1, &payload)?;
             }
             // Existing artifact aliases must still be accepted and present when
             // the new active manifest becomes a retention root.
@@ -158,17 +173,6 @@ pub(super) fn observed_time(db: &rusqlite::Connection, observed: i64) -> Result<
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     Ok(observed.max(watermark).max(committed))
-}
-pub(super) fn normalize_time(
-    tx: &rusqlite::Transaction<'_>,
-    observed: i64,
-) -> Result<i64, StoreError> {
-    let now = observed_time(tx, observed)?;
-    tx.execute(
-        "UPDATE runtime_identity SET last_time_ms=?1 WHERE singleton=1",
-        [now],
-    )?;
-    Ok(now)
 }
 fn receipt(
     tx: &rusqlite::Transaction<'_>,
@@ -300,6 +304,7 @@ mod tests {
                 .unwrap();
             let a = store.clone();
             let b = store.clone();
+            let before = store.write_metrics();
             let a = actix::spawn(async move { a.reserve_run_id().await });
             let b = actix::spawn(async move { b.reserve_run_id().await });
             let a = a.await.unwrap().unwrap();
@@ -307,6 +312,10 @@ mod tests {
             assert_ne!(a, b);
             assert_ne!(a, original);
             assert_ne!(b, original);
+            assert_eq!(store.write_metrics(), before);
+            assert_eq!(store.coordinator_time(2100).await.unwrap(), 2100);
+            assert_eq!(store.write_metrics(), before);
+            assert_eq!(store.coordinator_time(500).await.unwrap(), 1000);
             store
                 .acquire(&original, "owner".into(), 2000, 3000)
                 .await

@@ -24,11 +24,12 @@ pub(super) async fn drive(
     runtime: Arc<Runtime>,
     lease: RunLease,
     recovering: bool,
+    pure_batch_steps: usize,
 ) -> Result<Progress, RuntimeError> {
     let result = if recovering {
         validate(&runtime, &lease).await.map(|()| Progress::Changed)
     } else {
-        step::tick(runtime.clone(), lease.clone()).await
+        step::tick(runtime.clone(), lease.clone(), pure_batch_steps).await
     };
     match result {
         Err(RuntimeError::Storage(StoreError::Deadline(FailureCode::Timeout))) => {
@@ -43,7 +44,8 @@ pub(super) async fn drive(
                 | StoreError::Conflict
                 | StoreError::Terminal
                 | StoreError::Database
-                | StoreError::Closed,
+                | StoreError::Closed
+                | StoreError::CommitUnknown,
             ),
         ) => Err(error),
         Err(error) => {

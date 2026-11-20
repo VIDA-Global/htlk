@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const APPLICATION_ID: &str = "htlk.runtime.postgres";
 const SCHEMA: &str = include_str!("store_postgres.sql");
 
@@ -122,7 +122,7 @@ impl PostgresStore {
                 .map(|db| store_db::Connection::Postgres(Box::new(db)))
         })
         .await?;
-        Ok(Self(Store { connection, config }))
+        Ok(Self(Store::from_connection(connection, config)))
     }
     /// Drains queued work and closes this connection and its clones.
     ///
@@ -149,12 +149,13 @@ pub(crate) struct Database {
     settings: PostgresConfig,
     cursor: Cell<u64>,
     last_insert: Cell<i64>,
+    affected_rows: Cell<u64>,
     started: Cell<Option<Instant>>,
     broken: Cell<bool>,
     cursor_failed: Cell<bool>,
     statements: RefCell<BTreeMap<String, postgres::Statement>>,
     maximum_field_bytes: i64,
-    pub(crate) inspection_position: Cell<Option<i64>>,
+    pub(crate) projection: RefCell<crate::store::ProjectionBatch>,
 }
 impl Database {
     fn connect(
@@ -274,12 +275,13 @@ impl Database {
             settings,
             cursor: Cell::new(0),
             last_insert: Cell::new(0),
+            affected_rows: Cell::new(0),
             started: Cell::new(None),
             broken: Cell::new(false),
             cursor_failed: Cell::new(false),
             statements: RefCell::new(BTreeMap::new()),
             maximum_field_bytes,
-            inspection_position: Cell::new(None),
+            projection: Default::default(),
         })
     }
     pub(crate) fn begin(&self, mode: OperationMode) -> store_db::Result<()> {
@@ -291,14 +293,17 @@ impl Database {
             .borrow()
             .set_deadline(Some(Instant::now() + self.settings.operation_timeout));
         self.cursor_failed.set(false);
-        self.inspection_position.set(None);
         let result = match mode {
             OperationMode::Read => self.batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"),
             OperationMode::Exclusive => self.batch("BEGIN ISOLATION LEVEL READ COMMITTED; SELECT pg_advisory_xact_lock(hashtextextended(current_database() || ':' || current_schema(), 1213484107))"),
             OperationMode::Run(run) => self.batch("BEGIN ISOLATION LEVEL READ COMMITTED; SELECT pg_advisory_xact_lock_shared(hashtextextended(current_database() || ':' || current_schema(), 1213484107))").and_then(|()| {
-                // Gate before row lock; all narrowly gated writers take this
-                // lock before inspecting authority, revision or journal state.
-                self.query_one("SELECT sequence FROM runs WHERE run_id=?1 FOR UPDATE", vec![Value::Text(run)]).map(|_| ())
+                 // The two-int advisory lock space is distinct from the bigint
+                 // schema gate. Hash collisions only serialize unrelated runs.
+                 // A receipt-only retry must not generate WAL by locking a row.
+                 self.query_one(
+                     "SELECT 1::bigint FROM pg_advisory_xact_lock(hashtext(current_database() || ':' || current_schema()), hashtext(encode(?1::bytea,'hex')))",
+                     vec![Value::Blob(run.into_bytes())],
+                 ).map(|_| ())
             }),
         };
         if let Err(error) = result {
@@ -366,11 +371,18 @@ impl Database {
         if epoch {
             let row = client.query_one(&statement, &refs).map_err(pg_error)?;
             self.last_insert.set(row.get(0));
+            self.affected_rows
+                .set(self.affected_rows.get().saturating_add(1));
             Ok(1)
         } else {
-            usize::try_from(client.execute(&statement, &refs).map_err(pg_error)?)
-                .map_err(|_| Error::Invalid)
+            let count = client.execute(&statement, &refs).map_err(pg_error)?;
+            self.affected_rows
+                .set(self.affected_rows.get().saturating_add(count));
+            usize::try_from(count).map_err(|_| Error::Invalid)
         }
+    }
+    pub(crate) fn affected_rows(&self) -> u64 {
+        self.affected_rows.get()
     }
     pub(crate) fn last_insert_id(&self) -> i64 {
         self.last_insert.get()

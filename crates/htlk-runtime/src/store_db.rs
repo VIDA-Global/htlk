@@ -238,6 +238,7 @@ impl Row<'_> {
 pub(crate) struct SqliteConnection {
     inner: rusqlite::Connection,
     max_field_bytes: usize,
+    projection: std::cell::RefCell<crate::store::ProjectionBatch>,
 }
 #[cfg(feature = "sqlite")]
 impl SqliteConnection {
@@ -245,18 +246,21 @@ impl SqliteConnection {
         Self {
             inner,
             max_field_bytes: usize::MAX,
+            projection: Default::default(),
         }
     }
     fn close(self) -> std::result::Result<(), (Box<Self>, Error)> {
         let Self {
             inner,
             max_field_bytes,
+            projection,
         } = self;
         inner.close().map_err(|(inner, error)| {
             (
                 Box::new(Self {
                     inner,
                     max_field_bytes,
+                    projection,
                 }),
                 error.into(),
             )
@@ -499,20 +503,16 @@ impl Connection {
         };
         let _ = behavior;
         self.execute_batch(begin)?;
-        let inspection_position_before = match self {
-            #[cfg(feature = "postgres")]
-            Self::Postgres(db) => db.inspection_position.get(),
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(_) => None,
-        };
+        let projection_before = self
+            .projection()
+            .map(|batch| batch.borrow().mark())
+            .unwrap_or_default();
         Ok(Transaction {
             db: self,
             commit,
             rollback,
             finished: false,
-            #[cfg(feature = "sqlite")]
-            inspection_position: std::cell::Cell::new(None),
-            inspection_position_before,
+            projection_before,
         })
     }
     #[cfg(not(any(feature = "sqlite", feature = "postgres")))]
@@ -534,6 +534,9 @@ impl Connection {
         }
     }
     pub(crate) fn begin_operation(&self, mode: OperationMode) -> Result<()> {
+        if let Some(batch) = self.projection() {
+            *batch.borrow_mut() = Default::default();
+        }
         #[cfg(not(feature = "postgres"))]
         let _ = match &mode {
             OperationMode::Run(run) => Some(run),
@@ -548,6 +551,26 @@ impl Connection {
             Self::Disabled => Err(Error::Invalid),
         }
     }
+    pub(crate) fn projection(&self) -> Option<&std::cell::RefCell<crate::store::ProjectionBatch>> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(db) => Some(&db.projection),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(db) => Some(&db.projection),
+            #[cfg(not(any(feature = "sqlite", feature = "postgres")))]
+            Self::Disabled => None,
+        }
+    }
+    pub(crate) fn affected_rows(&self) -> u64 {
+        match self {
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(db) => db.total_changes(),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(db) => db.affected_rows(),
+            #[cfg(not(any(feature = "sqlite", feature = "postgres")))]
+            Self::Disabled => 0,
+        }
+    }
     #[cfg(feature = "postgres")]
     pub(crate) fn is_postgres(&self) -> bool {
         matches!(self, Self::Postgres(_))
@@ -555,7 +578,13 @@ impl Connection {
     pub(crate) fn finish_operation(&self, success: bool) -> Result<()> {
         match self {
             #[cfg(feature = "postgres")]
-            Self::Postgres(db) => db.finish(success),
+            Self::Postgres(db) => {
+                if success && let Err(error) = crate::store::flush_projection(self) {
+                    db.finish(false)?;
+                    return Err(error);
+                }
+                db.finish(success)
+            }
             #[cfg(feature = "sqlite")]
             Self::Sqlite(_) => {
                 let _ = success;
@@ -575,30 +604,14 @@ pub(crate) struct Transaction<'a> {
     commit: &'static str,
     rollback: &'static str,
     finished: bool,
-    #[cfg(any(feature = "sqlite", not(feature = "postgres")))]
-    inspection_position: std::cell::Cell<Option<i64>>,
-    inspection_position_before: Option<i64>,
+    projection_before: (usize, usize),
 }
 impl Transaction<'_> {
-    // PostgreSQL domain transactions are savepoints inside one worker-operation
-    // transaction: all released savepoints must publish the same physical pin.
-    pub(crate) fn inspection_position(&self) -> Option<i64> {
-        match self.db {
-            #[cfg(feature = "postgres")]
-            Connection::Postgres(db) => db.inspection_position.get(),
-            #[cfg(any(feature = "sqlite", not(feature = "postgres")))]
-            _ => self.inspection_position.get(),
-        }
-    }
-    pub(crate) fn set_inspection_position(&self, position: Option<i64>) {
-        match self.db {
-            #[cfg(feature = "postgres")]
-            Connection::Postgres(db) => db.inspection_position.set(position),
-            #[cfg(any(feature = "sqlite", not(feature = "postgres")))]
-            _ => self.inspection_position.set(position),
-        }
-    }
     pub(crate) fn commit(mut self) -> Result<()> {
+        #[cfg(feature = "sqlite")]
+        if matches!(self.db, Connection::Sqlite(_)) {
+            crate::store::flush_projection(self.db)?;
+        }
         self.db.execute_batch(self.commit)?;
         self.finished = true;
         Ok(())
@@ -614,7 +627,9 @@ impl Drop for Transaction<'_> {
     fn drop(&mut self) {
         if !self.finished {
             let _ = self.db.execute_batch(self.rollback);
-            self.set_inspection_position(self.inspection_position_before);
+            if let Some(batch) = self.db.projection() {
+                batch.borrow_mut().restore(self.projection_before);
+            }
         }
     }
 }

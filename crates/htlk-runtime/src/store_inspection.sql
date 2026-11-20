@@ -44,7 +44,7 @@ CREATE TABLE inspection_records (
     position INTEGER NOT NULL,
     revision INTEGER NOT NULL,
     final INTEGER NOT NULL,
-    payload BLOB NOT NULL,
+    payload_digest TEXT NOT NULL REFERENCES checkpoint_payloads(payload_digest),
     PRIMARY KEY(record_number,position)
 ) STRICT;
 CREATE TABLE inspection_changes (
