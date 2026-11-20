@@ -80,6 +80,48 @@ nodes{args=eval(json,{value=null}) echo=call(mcp.tool("fixture","echo"))}
 edges{edge args{from=args.outputs.value to=echo.inputs.arguments}edge value{from=echo.outputs.value to=outputs.value}}}"#;
 
 #[test]
+fn stdio_discovery_distinguishes_missing_tool_from_missing_final_reply() {
+    use htlk::runtime::{
+        identity::RunId,
+        mcp::{McpAdapter, McpRunContext},
+    };
+
+    let _campaign = campaign();
+    actix::System::new().block_on(async {
+        let limits = Limits::default();
+        let (compiler, _) = support::native_compiler();
+        let graph = compiler.compile_source(TOOL, &catalogs("stdio")).unwrap();
+        let binding = graph.canonical_document().fields().bindings.values().next().unwrap();
+        for (mode, expected) in [
+            ("missing", FailureCode::McpDescriptor),
+            ("missing-eof", FailureCode::McpTransport),
+        ] {
+            let peer = Peer::new("stdio", mode);
+            let adapter = peer.adapter();
+            let context = McpRunContext {
+                run_id: RunId::new(mode.into(), &limits).unwrap(),
+                host: caller(),
+                fence: 1,
+                cancellation: Default::default(),
+            };
+            let result = adapter.connect(binding, &context, &limits).await;
+            adapter.shutdown().await.unwrap();
+            let requests = peer.requests();
+            assert_eq!(result.err().map(|error| error.code()), Some(expected), "{mode}: {requests:#?}");
+
+            let [Value::Map(initialize), Value::Map(initialized), Value::Map(first), Value::Map(second)] = requests.as_slice() else {
+                panic!("{mode}: unexpected discovery requests: {requests:#?}");
+            };
+            for (request, method) in [(initialize, "initialize"), (initialized, "notifications/initialized"), (first, "tools/list"), (second, "tools/list")] {
+                assert_eq!(request.get("method"), Some(&Value::Text(method.into())), "{mode}");
+            }
+            assert!(matches!(first.get("params"), Some(Value::Map(params)) if params.get("cursor").is_none()), "{mode}");
+            assert!(matches!(second.get("params"), Some(Value::Map(params)) if params.get("cursor") == Some(&Value::Text("second-page".into()))), "{mode}");
+        }
+    });
+}
+
+#[test]
 fn non_tool_protocol_failures_cannot_publish_or_impersonate_tool_inference_sources() {
     let _campaign = campaign();
     actix::System::new().block_on(async {
