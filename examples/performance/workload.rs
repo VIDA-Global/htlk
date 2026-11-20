@@ -43,6 +43,10 @@ impl Workload {
         self.shape == "wait"
     }
 
+    pub fn is_short_chain(&self) -> bool {
+        self.shape == "chain" && self.nodes == 1
+    }
+
     pub fn peer(&self) -> Option<e2e::Peer> {
         let transport = match self.shape.as_str() {
             "stdio" => "stdio",

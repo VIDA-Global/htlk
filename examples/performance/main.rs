@@ -6,6 +6,7 @@ mod e2e;
 #[path = "../../tests/support/mod.rs"]
 mod support;
 
+mod mixed;
 mod recovery;
 mod workload;
 
@@ -45,6 +46,7 @@ const HELP: &str =
   [--workers 2] [--max-runs 64] [--coordinators 1] [--poll-ms 20] [--observe-ms 10]
   [--concurrency 16 | --rate 0] [--timeout-s 300] [--micro-samples 30]
   [--history-samples 20] [--readers 0] [--recovery-samples 0] [--cache 16] [--work-dir target]
+  [--mix-nodes 0] [--parked-runs 0] adds deep/wide runs and a parked population to a one-node chain.
   [--runs 0 --idle-ms 5000] measures an empty engine with no completion reader.
   PostgreSQL requires HTLK_PERF_POSTGRES_URL for a disposable database.";
 
@@ -65,6 +67,8 @@ struct Config {
     history_samples: usize,
     readers: usize,
     recovery_samples: usize,
+    mix_nodes: usize,
+    parked_runs: usize,
     idle_ms: u64,
     cache: usize,
     work_dir: PathBuf,
@@ -112,6 +116,8 @@ impl Config {
             history_samples: get("--history-samples", "20").parse()?,
             readers: get("--readers", "0").parse()?,
             recovery_samples: get("--recovery-samples", "0").parse()?,
+            mix_nodes: get("--mix-nodes", "0").parse()?,
+            parked_runs: get("--parked-runs", "0").parse()?,
             idle_ms: get("--idle-ms", "0").parse()?,
             cache: get("--cache", "16").parse()?,
             work_dir: get("--work-dir", "target").into(),
@@ -137,6 +143,10 @@ impl Config {
             || config.readers > 8
             || config.cache > 1024
             || config.recovery_samples > 30
+            || config.mix_nodes > 64
+            || config.parked_runs > 4096
+            || (config.parked_runs > 0 && config.mix_nodes == 0)
+            || (config.mix_nodes > 0 && (!config.workload.is_short_chain() || config.runs == 0))
             || (config.recovery_samples > 0 && !config.workload.is_wait())
         {
             return Err(
@@ -285,7 +295,7 @@ impl Observer {
 
 async fn submit(
     runtimes: &[Arc<Runtime>],
-    fingerprint: Digest,
+    graphs: [Digest; 3],
     config: &Config,
     slots: &Semaphore,
     count: usize,
@@ -304,6 +314,7 @@ async fn submit(
             at
         };
         let index = offset + i;
+        let fingerprint = graphs[mixed::class(index)];
         let runtime = runtimes[i % runtimes.len()].clone();
         let input = config.workload.input(index);
         tasks.spawn_local(async move {
@@ -340,7 +351,7 @@ struct Campaign<'a> {
     config: &'a Config,
     runtimes: &'a [Arc<Runtime>],
     reader: &'a Store,
-    fingerprint: Digest,
+    graphs: [Digest; 3],
 }
 
 impl Campaign<'_> {
@@ -356,7 +367,7 @@ impl Campaign<'_> {
             tokio::try_join!(
                 submit(
                     self.runtimes,
-                    self.fingerprint,
+                    self.graphs,
                     self.config,
                     &slots,
                     count,
@@ -485,7 +496,12 @@ async fn measure(config: Config) -> Result<()> {
     for _ in 1..config.coordinators {
         stores.push(database.open(false).await?);
     }
-    let (compiler, registry) = support::native_compiler_with_timeouts(60_000, 5_000);
+    let timeout_ms = if config.mix_nodes > 0 {
+        300_000
+    } else {
+        60_000
+    };
+    let (compiler, registry) = support::native_compiler_with_timeouts(timeout_ms, 5_000);
     let registry = Arc::new(registry);
     let engine_config = ExecutionConfig {
         workers: config.workers,
@@ -567,6 +583,28 @@ async fn measure(config: Config) -> Result<()> {
         &graph,
         config.micro_samples,
     )?;
+    let mut graphs = [graph.fingerprint; 3];
+    let parked_graph = if config.mix_nodes > 0 {
+        for (slot, shape) in [(1, "chain"), (2, "wide")] {
+            let work = Workload::new(shape, config.mix_nodes, 16, 0)?;
+            let compiled = compiler.compile_source(&work.source(), &catalogs)?;
+            runtimes[0]
+                .register_graph(&caller, &compiled.executable_bytes, &[])
+                .await?;
+            graphs[slot] = compiled.fingerprint;
+        }
+        let work = Workload::new("wait", 1, 16, 0)?;
+        let source = work
+            .source()
+            .replace("timeout_ms=50000", "timeout_ms=240000");
+        let compiled = compiler.compile_source(&source, &catalogs)?;
+        runtimes[0]
+            .register_graph(&caller, &compiled.executable_bytes, &[])
+            .await?;
+        Some((work, compiled.fingerprint))
+    } else {
+        None
+    };
     let mut engines = Vec::new();
     for runtime in &runtimes {
         engines.push(ExecutionEngine::launch(
@@ -574,12 +612,24 @@ async fn measure(config: Config) -> Result<()> {
             engine_config.clone(),
         )?);
     }
+    let parked = if let Some((work, fingerprint)) = parked_graph {
+        mixed::park(
+            &runtimes[0],
+            &reader,
+            &work,
+            fingerprint,
+            config.parked_runs,
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
 
     let campaign = Campaign {
         config: &config,
         runtimes: &runtimes,
         reader: &reader,
-        fingerprint: graph.fingerprint,
+        graphs,
     };
     let mut observer = Observer {
         cursor: 0,
@@ -623,6 +673,7 @@ async fn measure(config: Config) -> Result<()> {
     while let Some(result) = readers.join_next().await {
         reader_pages += result??;
     }
+    mixed::verify(&runtimes[0], &reader, parked).await?;
     for engine in engines {
         engine.shutdown().await?;
     }
@@ -639,6 +690,16 @@ async fn measure(config: Config) -> Result<()> {
             .find(|entry| entry.event == JournalEvent::OwnershipAcquired)
             .ok_or("missing ownership")?;
         let header = reader.run_header(&s.run).await?;
+        if config.mix_nodes > 0 {
+            if header.fingerprint != graphs[mixed::class(s.index)] {
+                return Err("wrong mixed graph executed".into());
+            }
+            println!(
+                "sample,mixed_{}_latency,{},1",
+                ["short", "chain", "wide"][mixed::class(s.index)],
+                micros(done.duration_since(s.planned))
+            );
+        }
         println!(
             "run,{},{},{},{},{},{},{},{}",
             s.index,

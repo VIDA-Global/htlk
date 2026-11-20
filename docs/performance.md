@@ -239,3 +239,28 @@ single follow-up compares the combined changes, not the isolated index cost.
    expiry and duplicate/corruption checks. Measure the remaining write cost before
    changing historical projections; the pinned discovery measurements do not
    explain the observed execution slowdown.
+
+## Mixed-workload qualification
+
+Reproduce the release trial with `--suite extended --cases mixed` on each
+backend. The workload offers one-node runs interleaved with chains and fan-out
+joins, alongside two inspection consumers and a population of runs that have
+already durably parked. Before resuming twelve sampled waits, it verifies that
+every parked run has the same header and fence as before the measured arrivals.
+Sampled replies must publish the expected output under a higher fence.
+
+| Backend | Measured runs | Nodes in chain / fan-out width | Parked runs | Offered → completed runs/s | Peak backlog | p95 / p99 | Parked reply p95 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| SQLite | 512 | 24 | 256 | 40 → 39.93 | 7 | 75.7 / 96.6 ms | 14.0 ms |
+| PostgreSQL 18 | 24 | 8 | 48 | 3 → 1.37 | 14 | 12.97 / 13.45 s | 227 ms |
+
+Both trials completed and verified all measured runs. The local PostgreSQL
+deployment accumulated 13 pending runs by the end of the offer and drained in
+9.81 s. The SQLite trial checkpointed about 104 MiB of additional storage and
+the driver peaked at 34.0 MiB RSS. The PostgreSQL trial recorded 27,405 commits
+and 11.8 MiB of WAL over the entire process window (including setup, verification,
+and readers), with 26.0 MiB driver RSS excluding the database server. These are
+diagnostic trials at different offered loads and graph sizes, not a comparison
+at equal load or a production SLO. PostgreSQL's small sample makes p99 the sample
+maximum; reducing shared publication and database round trips remains important
+for throughput on this deployment.

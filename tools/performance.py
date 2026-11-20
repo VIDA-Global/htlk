@@ -48,7 +48,10 @@ def cases(backend, suite):
             result.append(case(f"{transport}_{delay}ms", 24 if sqlite else 8,
                                shape=transport, peer_delay_ms=delay, concurrency=4))
     if suite == "extended":
-        result += [case("history_soak", 20_000 if sqlite else 1500, history_samples=50, timeout_s=3600, **shape_load),
+        result += [case("mixed", 512 if sqlite else 24, mix_nodes=24 if sqlite else 8,
+                        parked_runs=256 if sqlite else 48, readers=2, max_runs=8,
+                        rate=40 if sqlite else 3),
+                   case("history_soak", 20_000 if sqlite else 1500, history_samples=50, timeout_s=3600, **shape_load),
                    case("history_growth", 4096 if sqlite else 128, history_samples=30, **shape_load),
                    case("recovery", 12 if sqlite else 4, shape="wait", recovery_samples=3, **shape_load),
                    case("idle_20ms", 0, idle_ms=5000, warmup=0),
