@@ -3,7 +3,8 @@ use crate::Result;
 use htlk::{
     compiler::{analyzer, *},
     runtime::{
-        Authorization, HostContext, NativeRegistry, Runtime, RuntimeConfig, RuntimePolicy,
+        Authorization, HostContext, NativeRegistry, Runtime, RuntimeConfig, RuntimeError,
+        RuntimePolicy,
         execution::{ExecutionConfig, ExecutionEngine, RunView, WaitView},
         failure::{FailureCode, RuntimeFailure},
         identity::RunId,
@@ -23,8 +24,35 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(15);
+
+async fn poll_snapshot<S, T>(
+    timeout: Duration,
+    timeout_message: &'static str,
+    mut inspect: impl AsyncFnMut() -> std::result::Result<S, RuntimeError>,
+    mut select: impl FnMut(S) -> Result<Option<T>>,
+) -> Result<T> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            match inspect().await {
+                Ok(view) => {
+                    if let Some(result) = select(view)? {
+                        return Ok(result);
+                    }
+                }
+                // The coordinator committed during inspection. Retry only the read.
+                Err(error) if error.code() == FailureCode::Fenced => {}
+                Err(error) => return Err(error.into()),
+            }
+            actix::clock::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| timeout_message)?
+}
 
 struct GuidePolicy;
 impl RuntimePolicy for GuidePolicy {
@@ -233,42 +261,39 @@ impl Session {
         Ok(())
     }
 
-    pub async fn view(&self) -> Result<RunView> {
-        Ok(self
-            .runtime
-            .inspect_run(&self.context, self.run.as_ref().ok_or("run not started")?)
-            .await?)
+    async fn observe<T>(
+        &self,
+        timeout_message: &'static str,
+        select: impl FnMut(RunView) -> Result<Option<T>>,
+    ) -> Result<T> {
+        let run = self.run.as_ref().ok_or("run not started")?;
+        poll_snapshot(
+            OBSERVATION_TIMEOUT,
+            timeout_message,
+            || self.runtime.inspect_run(&self.context, run),
+            select,
+        )
+        .await
     }
 
     pub async fn wait(&self) -> Result<WaitView> {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            let view = self.view().await?;
+        self.observe("timed out waiting for the request to open", |view| {
             if let Some(wait) = view.waits.into_iter().next() {
-                return Ok(wait);
+                return Ok(Some(wait));
             }
             if view.header.status.is_terminal() {
                 return Err(format!("run ended before opening a wait: {:?}", view.failure).into());
             }
-            if Instant::now() >= deadline {
-                return Err("timed out waiting for the request to open".into());
-            }
-            actix::clock::sleep(Duration::from_millis(20)).await;
-        }
+            Ok(None)
+        })
+        .await
     }
 
     pub async fn terminal(&self) -> Result<RunView> {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            let view = self.view().await?;
-            if view.header.status.is_terminal() {
-                return Ok(view);
-            }
-            if Instant::now() >= deadline {
-                return Err("timed out waiting for the run to finish".into());
-            }
-            actix::clock::sleep(Duration::from_millis(20)).await;
-        }
+        self.observe("timed out waiting for the run to finish", |view| {
+            Ok(view.header.status.is_terminal().then_some(view))
+        })
+        .await
     }
 
     pub async fn output(&self, port: &str) -> Result<Value> {
@@ -308,7 +333,12 @@ impl Session {
         // Always stop supervision, including when a prompt returns menu/quit/EOF.
         let cleanup: Result<()> = async {
             if let Some(run) = &self.run
-                && !self.view().await?.header.status.is_terminal()
+                && !self
+                    .observe(
+                        "timed out inspecting the run before leaving the lesson",
+                        |view| Ok(Some(view.header.status.is_terminal())),
+                    )
+                    .await?
             {
                 self.runtime
                     .cancel_run(&self.context, run, "left tutorial lesson", "guide-cancel")
@@ -322,5 +352,73 @@ impl Session {
         cleanup?;
         shutdown?;
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_poll_recovers_from_fencing_but_preserves_other_failures() {
+        actix::System::new().block_on(async {
+            let mut snapshots = [
+                Err(RuntimeError::Failure(RuntimeFailure::new(
+                    FailureCode::Fenced,
+                ))),
+                Ok(None),
+                Ok(Some("ready")),
+            ]
+            .into_iter();
+            let result = poll_snapshot(
+                Duration::from_secs(2),
+                "snapshot timed out",
+                async || snapshots.next().expect("extra inspection"),
+                Ok,
+            )
+            .await;
+            assert_eq!(result.unwrap(), "ready");
+
+            let mut inspected = false;
+            let error = poll_snapshot(
+                Duration::from_secs(2),
+                "snapshot timed out",
+                async || {
+                    assert!(!std::mem::replace(&mut inspected, true));
+                    Err::<(), _>(RuntimeError::Failure(RuntimeFailure::new(
+                        FailureCode::Policy,
+                    )))
+                },
+                |_| -> Result<Option<()>> { panic!("no authorized snapshot was returned") },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<RuntimeError>().unwrap().code(),
+                FailureCode::Policy
+            );
+        });
+    }
+
+    #[test]
+    fn persistent_fencing_keeps_the_polling_deadline() {
+        actix::System::new().block_on(async {
+            let error = poll_snapshot(
+                Duration::ZERO,
+                "timed out waiting for the request to open",
+                async || {
+                    Err::<(), _>(RuntimeError::Failure(RuntimeFailure::new(
+                        FailureCode::Fenced,
+                    )))
+                },
+                |_| -> Result<Option<()>> { panic!("no stable snapshot was returned") },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "timed out waiting for the request to open"
+            );
+        });
     }
 }

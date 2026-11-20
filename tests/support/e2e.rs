@@ -378,7 +378,27 @@ impl Harness {
             .start_run(&caller(), graph.fingerprint, &inputs, key, None)
             .await
             .unwrap();
-        terminal(&self.runtime, &run.run_id).await
+        // Wait on the committed header rather than repeatedly inspecting every
+        // active scope and artifact on the same store the workers need to write.
+        let timeout = Duration::from_millis(crate::support::store::io_budget_ms(20000));
+        tokio::time::timeout(timeout, async {
+            loop {
+                if self
+                    .store
+                    .run_header(&run.run_id)
+                    .await
+                    .unwrap()
+                    .status
+                    .is_terminal()
+                {
+                    return;
+                }
+                actix::clock::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("execution stalled: {} ({key})", run.run_id));
+        inspect(&self.runtime, &run.run_id).await
     }
     pub async fn close(self) {
         self.engine.shutdown().await.unwrap();
