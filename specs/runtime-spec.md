@@ -330,6 +330,17 @@ MCP has no universal idempotency-key behavior for arbitrary tools. Trusted adapt
 
 Response persistence precedes result acceptance. A crash after `response_recorded` retries local validation/commit without recalling MCP. Output schema failures may allow another safe dispatch only under an explicit retry code and replay policy. Input/precondition, descriptor, capability, and deterministic pure failures are not repaired by repeating the same call.
 
+A trusted host that durably saved a correlated response before native response
+persistence may submit that exact response under a current successor fence. The
+runtime MUST check current recovery authorization and the original store, run,
+invocation, attempt, binding and request. First submission requires a still-active
+attempt and ancestry, an outstanding reservation and unelapsed original deadlines.
+The response checkpoint and its replay receipt commit atomically. This path uses
+normal response validation and evidence, but cannot resend the operation, replace
+the attempt or replenish accounting. An exact retry under current authority returns
+the original receipt. Conflicts and first late submissions leave execution and
+terminal outcomes unchanged; the host retains its original late evidence.
+
 Retries never change inputs. Changed prompts or arguments require another node or loop iteration. Compensating operations are explicit graph nodes and may themselves fail.
 
 ## 8. Atomic output acceptance and artifacts

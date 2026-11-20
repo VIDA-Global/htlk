@@ -150,7 +150,7 @@ assert.equal(get(profile, 'core_digest').value, native([
     'mcp/client/session.rs', 'mcp/client/session/wire.rs', 'mcp/client/session/wire/callbacks.rs',
     'mcp/client/session/wire/tasks.rs', 'mcp/client/session/wire/notifications.rs',
     'mcp/client/session/wire/http.rs', 'mcp/client/session/wire/payload.rs', 'mcp/client/session/wire/sse.rs',
-    'mcp/native_sessions.rs', 'mcp_control.rs', 'execution/mcp.rs', 'execution/approval.rs', 'execution/extension.rs', 'store_late.sql', 'retention.rs', 'source.rs', 'store_retention.rs', 'execution/recovery.rs', 'mcp_protocol.rs', 'mcp_extract.rs', 'mcp_normalize.rs', 'uri_template.rs',
+    'mcp/native_sessions.rs', 'mcp_control.rs', 'execution/mcp.rs', 'execution/mcp_recovery.rs', 'execution/approval.rs', 'execution/extension.rs', 'store_late.sql', 'retention.rs', 'source.rs', 'store_retention.rs', 'execution/recovery.rs', 'mcp_protocol.rs', 'mcp_extract.rs', 'mcp_normalize.rs', 'uri_template.rs',
     'artifact_access.rs', 'execution/artifacts.rs', 'execution/boundary.rs', 'execution/retry.rs',
     'store_mcp.rs', 'store_mcp_run.rs', 'store_mcp.sql',
     'store_mcp_tasks.rs', 'store_mcp_tasks.sql', 'store_mcp_remote_tasks.rs', 'store_mcp_remote_tasks.sql',

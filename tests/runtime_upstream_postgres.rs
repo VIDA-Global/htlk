@@ -5,6 +5,11 @@
 #[allow(dead_code)]
 mod commit_proxy;
 #[allow(dead_code)]
+#[path = "support/e2e.rs"]
+mod e2e;
+#[path = "support/graph_recovery.rs"]
+mod graph_recovery;
+#[allow(dead_code)]
 mod support;
 
 use htlk::runtime::{

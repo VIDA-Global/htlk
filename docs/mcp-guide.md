@@ -610,6 +610,26 @@ intent spend no calls. Ambiguity retains outstanding reservations even for trust
 replay-safe operations. A separate non-authoritative late-response inbox retains
 late evidence: fenced or terminal results cannot publish outputs.
 
+#### Recover a host-saved graph response
+
+A managed adapter that durably saves a correlated reply before returning it to
+HTLK should save `McpAttemptContext::graph_attempt()` alongside the original
+`McpOutcome` and any protected `McpRpcError`. The saved identity is specific to
+the original graph attempt; it grants no authority by itself.
+
+After owner loss, keep the run unselected in an `Attached` engine. Using trusted
+coordinator time, acquire a short successor lease for that run with `Store::acquire`.
+Call `Runtime::recover_graph_mcp_response` with that lease and the exact saved
+evidence. The deployment must explicitly grant `RuntimePolicy::authorize_graph_mcp_recovery`.
+After the lease expires, attach the run normally. The engine applies the usual
+normalization, checks, and output publication to the saved response locally.
+
+If the response COMMIT acknowledgment is lost, reopen the same store and retry
+the identical evidence with current successor authority. If the attempt can no
+longer accept a first response, keep the original evidence in host storage. The
+submission does not reopen a finished run or change its outcome. This API is for
+graph responses; `McpClient::recover_work` addresses client interaction work.
+
 Retries require the authored count, exact failure code, explicit backoff, remaining
 deadline/budget, current trusted replay safety and approval. Every attempt reuses the
 frozen arguments. An unsafe `possibly_sent` takeover fails `E_EFFECT_UNCERTAIN`.
