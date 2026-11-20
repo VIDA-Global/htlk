@@ -8,6 +8,8 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ### Added
 
+- Hosts can freeze an absolute run admission deadline and reconcile an original
+  admission receipt without creating work.
 - Opt-in bounded pure-eval batching. Logical decisions remain in the journal;
   one inspection pin represents the batch's committed state.
 - Per-connection write-operation and affected-row counters for performance campaigns.

@@ -1,6 +1,7 @@
 //! Durable host receipt and initial run publication transactions.
 use super::*;
 use crate::{identity::ArtifactId, records::ManifestEntry, run::PreparedRun};
+use std::sync::Arc;
 
 pub(crate) struct HostRequest {
     pub principal: String,
@@ -8,6 +9,14 @@ pub(crate) struct HostRequest {
     pub target: String,
     pub key: String,
     pub digest: Digest,
+}
+pub(crate) enum AdmissionTime {
+    Relative(i64),
+    Absolute {
+        not_after_ms: i64,
+        observed: i64,
+        clock: Arc<dyn crate::clock::CoordinatorClock>,
+    },
 }
 pub(crate) struct RunIdBlock {
     namespace: String,
@@ -80,7 +89,7 @@ impl SqliteStore {
             .read(move |db| -> Result<Option<RunId>, StoreError> {
                 let tx = db.transaction()?;
                 let now = observed_time(&tx, observed)?;
-                let receipt = receipt(&tx, &request, now, &limits)?;
+                let receipt = receipt(&tx, &request, now, &limits, false)?;
                 tx.commit()?;
                 Ok(receipt)
             })
@@ -91,15 +100,26 @@ impl SqliteStore {
         &self,
         prepared: PreparedRun,
         request: HostRequest,
-        observed: i64,
+        time: AdmissionTime,
         retention: i64,
     ) -> Result<RunId, StoreError> {
         request.check(&self.config.limits)?;
         let limits = self.config.limits.clone();
         self.connection.call(move|db|->Result<RunId,StoreError>{
             let tx=db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let (observed, not_after_ms) = match time {
+                AdmissionTime::Relative(observed) => (observed, None),
+                AdmissionTime::Absolute { not_after_ms, observed, clock } => {
+                    let current = clock.now_ms().map_err(|_| StoreError::Invalid)?;
+                    timestamp(current)?;
+                    (current.max(observed), Some(not_after_ms))
+                }
+            };
             let now=observed_time(&tx,observed)?;
-            if let Some(old)=receipt(&tx,&request,now,&limits)?{tx.commit()?;return Ok(old)}
+            if let Some(old)=receipt(&tx,&request,now,&limits,not_after_ms.is_some())?{tx.commit()?;return Ok(old)}
+            if not_after_ms.is_some_and(|deadline| now >= deadline) {
+                return Err(StoreError::Deadline(FailureCode::Timeout));
+            }
             let expires=now.checked_add(retention).ok_or(StoreError::Invalid)?;
             if retention<=0{return Err(StoreError::Invalid)}
             let graph:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM graphs WHERE fingerprint=?1)",[prepared.fingerprint.to_string()],|r|r.get(0))?;
@@ -109,7 +129,7 @@ impl SqliteStore {
             if inserted!=1{return Err(StoreError::Conflict)}
             let created=cbor::encode(&Value::Array(vec![Value::Text(prepared.fingerprint.to_string()),Value::Text(root.to_string())]),&limits)?;
             append_event(&tx,prepared.run_id.as_str(),1,EventMeta{kind:"run_created",actor:&request.principal,timestamp:now,causation:"start_run",command:None},&created,&limits)?;
-            let records=prepared.initial_records(now)?;
+            let records=prepared.initial_records(now,not_after_ms)?;
             let failed=prepared.failure.is_some();
             let mut transition=Transition{context:TransitionContext{command_id:request.key.clone(),actor:request.principal.clone(),causation:request.method.clone(),timestamp_ms:now},writes:records,next_status:if failed{Some(RunStatus::Failed)}else{None},root:None,expected_fingerprint:Some(prepared.fingerprint)};
             let body=transitions::transition_body(&mut transition,&limits)?;
@@ -179,16 +199,20 @@ fn receipt(
     request: &HostRequest,
     now: i64,
     limits: &Limits,
+    refuse_reuse: bool,
 ) -> Result<Option<RunId>, StoreError> {
     let old=tx.query_row("SELECT request_digest,run_id,expires_at_ms FROM host_receipts WHERE principal=?1 AND method=?2 AND target=?3 AND idempotency_key=?4",params![request.principal,request.method,request.target,request.key],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?))).optional()?;
     let Some((digest, run, expiry)) = old else {
         return Ok(None);
     };
-    if now >= expiry {
+    if now >= expiry && !refuse_reuse {
         return Ok(None);
     }
     if digest != request.digest.to_string() {
         return Err(StoreError::IdempotencyConflict);
+    }
+    if now >= expiry {
+        return Err(StoreError::Expired);
     }
     Ok(Some(
         RunId::new(run, limits).map_err(|_| StoreError::Corrupt)?,
@@ -285,7 +309,7 @@ mod tests {
             let (store,prepared,request)=setup().await;
             let run=prepared.run_id.clone();
             store.connection.call(|db|db.execute_batch("CREATE TRIGGER fail_receipt BEFORE INSERT ON host_receipts BEGIN SELECT RAISE(ABORT,'injected'); END;")).await.unwrap();
-            assert_eq!(store.initialize_run(prepared,request.owned(),1000,100).await,Err(StoreError::Database));
+            assert_eq!(store.initialize_run(prepared,request.owned(),AdmissionTime::Relative(1000),100).await,Err(StoreError::Database));
             assert_eq!(store.run_header(&run).await,Err(StoreError::Missing));
             assert!(store.pending_outbox(100).await.unwrap().is_empty());
             assert!(store.host_receipt(&request,1000).await.unwrap().is_none());
@@ -299,7 +323,7 @@ mod tests {
             let (store, prepared, request) = setup().await;
             let original = prepared.run_id.clone();
             store
-                .initialize_run(prepared, request, 1000, 100)
+                .initialize_run(prepared, request, AdmissionTime::Relative(1000), 100)
                 .await
                 .unwrap();
             let a = store.clone();
@@ -329,7 +353,7 @@ mod tests {
             let (store, prepared, request) = setup().await;
             let expected = request.digest;
             let run = store
-                .initialize_run(prepared, request, 1000, 100)
+                .initialize_run(prepared, request, AdmissionTime::Relative(1000), 100)
                 .await
                 .unwrap();
             let events = store.journal(&run, 0, 100).await.unwrap();

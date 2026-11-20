@@ -6,7 +6,7 @@ use crate::{
     failure::{FailureBoundary, FailureCode},
     identity::{ArtifactId, host_request_digest},
     records::{InputValue, ManifestEntry, SecurityLabels},
-    store::runs::HostRequest,
+    store::runs::{AdmissionTime, HostRequest},
     validate_typed_value,
 };
 use crate::{
@@ -59,38 +59,153 @@ impl Runtime {
         idempotency_key: &str,
         limits: Option<&ExecutionLimits>,
     ) -> Result<RunStarted, RuntimeError> {
+        self.start_run_inner(context, fingerprint, inputs, idempotency_key, limits, None)
+            .await
+    }
+
+    /// Starts a run subject to a caller-frozen, exclusive epoch-millisecond deadline.
+    /// The coordinator checks it after acquiring write authority. Both the run and
+    /// root scope retain the earlier of this bound and their existing limits.
+    /// A retained identical receipt wins even after the deadline; the bound is part
+    /// of the original request identity. Reuse of expired indexed evidence is refused.
+    ///
+    /// # Errors
+    /// Returns the same admission errors as [`Self::start_run`], plus an elapsed
+    /// deadline or expired receipt. After an uncertain commit, use
+    /// [`Self::reconcile_run_start`] to check for positive evidence without admission.
+    pub async fn start_run_not_after(
+        &self,
+        context: &HostContext,
+        fingerprint: Digest,
+        inputs: &BTreeMap<Identifier, InputValue>,
+        idempotency_key: &str,
+        limits: Option<&ExecutionLimits>,
+        not_after_ms: i64,
+    ) -> Result<RunStarted, RuntimeError> {
+        self.start_run_inner(
+            context,
+            fingerprint,
+            inputs,
+            idempotency_key,
+            limits,
+            Some(not_after_ms),
+        )
+        .await
+    }
+
+    /// Computes the canonical run admission identity before a host submits work.
+    /// `None` identifies the relative API; `Some` identifies the frozen absolute API.
+    ///
+    /// # Errors
+    /// Returns invalid or out-of-bounds arguments.
+    pub fn start_run_request_digest(
+        &self,
+        context: &HostContext,
+        fingerprint: Digest,
+        inputs: &BTreeMap<Identifier, InputValue>,
+        limits: Option<&ExecutionLimits>,
+        not_after_ms: Option<i64>,
+    ) -> Result<Digest, RuntimeError> {
+        if not_after_ms.is_some_and(|deadline| deadline < 0) {
+            return Err(RuntimeError::failure(FailureCode::Input));
+        }
         let requested = limits.cloned().unwrap_or_default();
+        let arguments = request_arguments(inputs, &requested, not_after_ms, &self.config.limits)?;
+        host_request_digest(
+            context.principal(),
+            "start_run",
+            &fingerprint.to_string(),
+            &arguments,
+            &self.config.limits,
+        )
+        .map_err(|_| RuntimeError::failure(FailureCode::Input))
+    }
+
+    /// Checks a retained receipt for the exact original request without admitting work.
+    /// `None` means no retained receipt was found, not that admission did not commit.
+    /// A known run's initialization journal can still provide positive historical evidence.
+    ///
+    /// # Errors
+    /// Returns current authorization, conflicting identity, or lookup failure.
+    pub async fn reconcile_run_start(
+        &self,
+        context: &HostContext,
+        fingerprint: Digest,
+        inputs: &BTreeMap<Identifier, InputValue>,
+        idempotency_key: &str,
+        limits: Option<&ExecutionLimits>,
+        not_after_ms: Option<i64>,
+    ) -> Result<Option<RunStarted>, RuntimeError> {
+        let requested = limits.cloned().unwrap_or_default();
+        let request = self.start_request(
+            context,
+            fingerprint,
+            inputs,
+            idempotency_key,
+            &requested,
+            not_after_ms,
+        )?;
+        Ok(self
+            .store
+            .host_receipt(&request, self.clock.now_ms()?)
+            .await?
+            .map(|run_id| RunStarted { run_id }))
+    }
+
+    fn start_request(
+        &self,
+        context: &HostContext,
+        fingerprint: Digest,
+        inputs: &BTreeMap<Identifier, InputValue>,
+        idempotency_key: &str,
+        limits: &ExecutionLimits,
+        not_after_ms: Option<i64>,
+    ) -> Result<HostRequest, RuntimeError> {
         self.policy.authorize(
             context,
             Authorization::StartRun {
                 fingerprint,
-                limits: &requested,
+                limits,
             },
         )?;
-        let mut request_metadata = RecordAccounting::new(&self.config.limits)?;
-        request_metadata
-            .text(idempotency_key, 0)
-            .and_then(|()| request_metadata.text(context.principal(), 0))
-            .map_err(|_| RuntimeError::failure(FailureCode::Input))?;
         if idempotency_key.is_empty() {
             return Err(RuntimeError::failure(FailureCode::Input));
         }
-        let arguments = request_arguments(inputs, &requested, &self.config.limits)?;
         let request = HostRequest {
             principal: context.principal().into(),
             method: "start_run".into(),
             target: fingerprint.to_string(),
             key: idempotency_key.into(),
-            digest: host_request_digest(
-                context.principal(),
-                "start_run",
-                &fingerprint.to_string(),
-                &arguments,
-                &self.config.limits,
-            )
-            .map_err(|_| RuntimeError::failure(FailureCode::Input))?,
+            digest: self.start_run_request_digest(
+                context,
+                fingerprint,
+                inputs,
+                Some(limits),
+                not_after_ms,
+            )?,
         };
         request.check(&self.config.limits)?;
+        Ok(request)
+    }
+
+    async fn start_run_inner(
+        &self,
+        context: &HostContext,
+        fingerprint: Digest,
+        inputs: &BTreeMap<Identifier, InputValue>,
+        idempotency_key: &str,
+        limits: Option<&ExecutionLimits>,
+        not_after_ms: Option<i64>,
+    ) -> Result<RunStarted, RuntimeError> {
+        let requested = limits.cloned().unwrap_or_default();
+        let request = self.start_request(
+            context,
+            fingerprint,
+            inputs,
+            idempotency_key,
+            &requested,
+            not_after_ms,
+        )?;
         let now = self.clock.now_ms()?;
         if let Some(run_id) = self.store.host_receipt(&request, now).await? {
             return Ok(RunStarted { run_id });
@@ -336,13 +451,20 @@ impl Runtime {
             audit_retention_ms: self.config.audit_retention_ms as i64,
             limits: self.config.limits.clone(),
         };
-        let observed = self.clock.now_ms()?.max(now);
+        let time = match not_after_ms {
+            Some(not_after_ms) => AdmissionTime::Absolute {
+                not_after_ms,
+                observed: now,
+                clock: self.clock.clone(),
+            },
+            None => AdmissionTime::Relative(self.clock.now_ms()?.max(now)),
+        };
         let run_id = self
             .store
             .initialize_run(
                 prepared,
                 request,
-                observed,
+                time,
                 self.config.idempotency_retention_ms as i64,
             )
             .await?;
@@ -353,6 +475,7 @@ impl Runtime {
 fn request_arguments(
     inputs: &BTreeMap<Identifier, InputValue>,
     limits: &ExecutionLimits,
+    not_after_ms: Option<i64>,
     codec: &Limits,
 ) -> Result<Value, RuntimeError> {
     let mut accounting = RecordAccounting::new(codec)?;
@@ -370,7 +493,7 @@ fn request_arguments(
             .map_err(|_| RuntimeError::failure(FailureCode::Input))?;
         values.push((name.to_string(), value));
     }
-    Ok(Value::Map(Map::try_from_entries([
+    let mut arguments = vec![
         ("inputs".into(), Value::Map(Map::try_from_entries(values)?)),
         (
             "limits".into(),
@@ -378,7 +501,11 @@ fn request_arguments(
                 .to_value(codec)
                 .map_err(|_| RuntimeError::failure(FailureCode::Input))?,
         ),
-    ])?))
+    ];
+    if let Some(deadline) = not_after_ms {
+        arguments.push(("not_after_ms".into(), Value::Integer(deadline)));
+    }
+    Ok(Value::Map(Map::try_from_entries(arguments)?))
 }
 fn charge_input(
     accounting: &mut RecordAccounting<'_>,
@@ -435,18 +562,30 @@ impl PreparedRun {
     pub(crate) fn root(&self) -> Result<ScopeInstanceId, StoreError> {
         ScopeInstanceId::root(&self.run_id, &self.limits).map_err(|_| StoreError::Invalid)
     }
-    pub(crate) fn initial_records(&self, now: i64) -> Result<Vec<RecordWrite>, StoreError> {
+    pub(crate) fn initial_records(
+        &self,
+        now: i64,
+        not_after_ms: Option<i64>,
+    ) -> Result<Vec<RecordWrite>, StoreError> {
         let root = self.root()?;
         let failed = self.failure.is_some();
         let deadline = if failed {
             None
         } else {
-            Some(deadline_value(now, self.scope_limits.timeout_ms())?)
+            Some(deadline_value(
+                now,
+                self.scope_limits.timeout_ms(),
+                not_after_ms,
+            )?)
         };
         let run_deadline = if failed {
             None
         } else {
-            Some(deadline_value(now, self.run_limits.timeout_ms())?)
+            Some(deadline_value(
+                now,
+                self.run_limits.timeout_ms(),
+                not_after_ms,
+            )?)
         };
         let error = self.failure.as_ref().map_or(Ok(Value::Null), |f| {
             f.to_value(&self.limits).map_err(|_| StoreError::Invalid)
@@ -609,9 +748,21 @@ impl PreparedRun {
         Ok(records)
     }
 }
-fn deadline_value(now: i64, timeout: Option<u64>) -> Result<i64, StoreError> {
-    let timeout =
-        i64::try_from(timeout.ok_or(StoreError::Invalid)?).map_err(|_| StoreError::Invalid)?;
+fn deadline_value(
+    now: i64,
+    timeout: Option<u64>,
+    not_after_ms: Option<i64>,
+) -> Result<i64, StoreError> {
+    let timeout = timeout.ok_or(StoreError::Invalid)?;
+    let timeout = if let Some(bound) = not_after_ms {
+        timeout.min(
+            u64::try_from(bound.checked_sub(now).ok_or(StoreError::Invalid)?)
+                .map_err(|_| StoreError::Invalid)?,
+        )
+    } else {
+        timeout
+    };
+    let timeout = i64::try_from(timeout).map_err(|_| StoreError::Invalid)?;
     if timeout <= 0 {
         return Err(StoreError::Invalid);
     }

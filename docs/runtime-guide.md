@@ -213,6 +213,13 @@ Trusted coordinator time is normalized against durable watermarks; wall-clock
 rollback cannot revive expired requests. Run IDs are opaque and not reused after
 failed reservations.
 
+Use `Runtime::start_run_not_after` when the embedding service has already frozen
+an absolute deadline. Pass the original epoch milliseconds on every retry. The
+runtime checks the bound under the admission lock and caps the original run and
+root deadlines. `start_run_request_digest` lets a host freeze the exact request
+identity. After a lost acknowledgment, `reconcile_run_start` only looks up the
+original receipt; an empty result does not authorize another admission.
+
 Execution uses immutable inputs, lazy reads, durable guard/binding decisions, and
 fenced atomic acceptance. A scope settles all children before publishing outputs;
 failed children may feed authored fallbacks. Task definition and wrapper contracts

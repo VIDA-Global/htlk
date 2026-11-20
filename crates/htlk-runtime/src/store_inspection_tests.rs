@@ -413,7 +413,7 @@ async fn initialization_and_expiry(store: &Store) {
         digest: Digest::from_bytes([3; 32]),
     };
     store
-        .initialize_run(prepared, request, 0, 100)
+        .initialize_run(prepared, request, runs::AdmissionTime::Relative(0), 100)
         .await
         .unwrap();
     let initialized = store.open_inspection_snapshot(&run, None).await.unwrap();
