@@ -183,7 +183,7 @@ impl SqliteStore {
         lease: &RunLease,
         transition: Transition,
     ) -> Result<CommitReceipt, StoreError> {
-        self.commit_at_sequence(lease, transition, None).await
+        self.commit_transition(lease, transition, None, false).await
     }
 
     pub(crate) async fn commit_at_sequence(
@@ -191,6 +191,17 @@ impl SqliteStore {
         lease: &RunLease,
         transition: Transition,
         sequence: Option<i64>,
+    ) -> Result<CommitReceipt, StoreError> {
+        self.commit_transition(lease, transition, sequence, true)
+            .await
+    }
+
+    async fn commit_transition(
+        &self,
+        lease: &RunLease,
+        transition: Transition,
+        sequence: Option<i64>,
+        coordinated: bool,
     ) -> Result<CommitReceipt, StoreError> {
         let limits = self.config.limits.clone();
         let prepared = PreparedTransition::new(lease, transition, &limits)?;
@@ -200,7 +211,8 @@ impl SqliteStore {
                 lease.run_id().to_string(),
                 move |db| -> Result<CommitReceipt, StoreError> {
                     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                    let receipt = prepared.apply_at_sequence(&tx, &lease, &limits, sequence)?;
+                    let receipt =
+                        prepared.apply_at_sequence(&tx, &lease, &limits, sequence, coordinated)?;
                     tx.commit()?;
                     Ok(receipt)
                 },
@@ -442,7 +454,7 @@ impl PreparedTransition {
         lease: &RunLease,
         limits: &Limits,
     ) -> Result<CommitReceipt, StoreError> {
-        self.apply_at_sequence(tx, lease, limits, None)
+        self.apply_at_sequence(tx, lease, limits, None, false)
     }
 
     fn apply_at_sequence(
@@ -451,6 +463,7 @@ impl PreparedTransition {
         lease: &RunLease,
         limits: &Limits,
         sequence: Option<i64>,
+        coordinated: bool,
     ) -> Result<CommitReceipt, StoreError> {
         let Self {
             transition,
@@ -459,7 +472,10 @@ impl PreparedTransition {
             writes,
         } = self;
         let header = load_header(tx, &lease.run_id)?;
-        let now = transition.context.timestamp_ms.max(header.last_time_ms);
+        let mut now = transition.context.timestamp_ms.max(header.last_time_ms);
+        if coordinated {
+            now = runs::observed_time(tx, now)?;
+        }
         check_authority(&header, lease, now)?;
         if sequence.is_some_and(|expected| header.sequence != expected) {
             return Err(StoreError::Conflict);

@@ -14,6 +14,9 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ### Changed
 
+- Scheduling time probes and host receipt lookups are read-only. Run-ID
+  allocation reserves durable blocks, and execution commits normalize time in
+  the accepting transaction.
 - PostgreSQL scheduling and historical reads use ungated repeatable-read snapshots.
   Ordinary single-run writes coordinate on the run row and order publication at
   the inspection clock. Hosts can route independent SQLite or PostgreSQL stores

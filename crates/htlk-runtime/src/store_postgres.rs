@@ -122,7 +122,7 @@ impl PostgresStore {
                 .map(|db| store_db::Connection::Postgres(Box::new(db)))
         })
         .await?;
-        Ok(Self(Store { connection, config }))
+        Ok(Self(Store::from_connection(connection, config)))
     }
     /// Drains queued work and closes this connection and its clones.
     ///

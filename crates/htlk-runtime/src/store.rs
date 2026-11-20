@@ -101,6 +101,7 @@ impl Default for StoreConfig {
 pub struct Store {
     pub(crate) connection: Connection,
     pub(crate) config: StoreConfig,
+    pub(crate) run_ids: std::sync::Arc<tokio::sync::Mutex<Option<runs::RunIdBlock>>>,
 }
 /// Compatibility name for the store's SQLite constructors.
 ///
@@ -198,7 +199,14 @@ impl Store {
             })
             .await
             .map_err(StoreError::from_worker)?;
-        Ok(Self { connection, config })
+        Ok(Self::from_connection(connection, config))
+    }
+    pub(crate) fn from_connection(connection: Connection, config: StoreConfig) -> Self {
+        Self {
+            connection,
+            config,
+            run_ids: Default::default(),
+        }
     }
     /// Returns the host-selected bounded database settings.
     pub fn config(&self) -> &StoreConfig {

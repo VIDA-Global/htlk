@@ -323,10 +323,7 @@ pub(super) async fn commit(
     writes: Vec<RecordWrite>,
     status: Option<RunStatus>,
 ) -> Result<(), RuntimeError> {
-    let now = runtime
-        .store
-        .coordinator_time(runtime.clock.now_ms()?)
-        .await?;
+    let now = runtime.clock.now_ms()?;
     let retained = working::with(|_| {
         writes
             .iter()
