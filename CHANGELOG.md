@@ -8,6 +8,7 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ### Added
 
+- Per-connection write-operation and affected-row counters for performance campaigns.
 - Repeatable release-mode performance campaigns for durable SQLite and PostgreSQL,
   with raw timing samples and correctness checks under load.
 

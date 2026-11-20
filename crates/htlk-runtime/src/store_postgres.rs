@@ -149,6 +149,7 @@ pub(crate) struct Database {
     settings: PostgresConfig,
     cursor: Cell<u64>,
     last_insert: Cell<i64>,
+    affected_rows: Cell<u64>,
     started: Cell<Option<Instant>>,
     broken: Cell<bool>,
     cursor_failed: Cell<bool>,
@@ -274,6 +275,7 @@ impl Database {
             settings,
             cursor: Cell::new(0),
             last_insert: Cell::new(0),
+            affected_rows: Cell::new(0),
             started: Cell::new(None),
             broken: Cell::new(false),
             cursor_failed: Cell::new(false),
@@ -366,11 +368,18 @@ impl Database {
         if epoch {
             let row = client.query_one(&statement, &refs).map_err(pg_error)?;
             self.last_insert.set(row.get(0));
+            self.affected_rows
+                .set(self.affected_rows.get().saturating_add(1));
             Ok(1)
         } else {
-            usize::try_from(client.execute(&statement, &refs).map_err(pg_error)?)
-                .map_err(|_| Error::Invalid)
+            let count = client.execute(&statement, &refs).map_err(pg_error)?;
+            self.affected_rows
+                .set(self.affected_rows.get().saturating_add(count));
+            usize::try_from(count).map_err(|_| Error::Invalid)
         }
+    }
+    pub(crate) fn affected_rows(&self) -> u64 {
+        self.affected_rows.get()
     }
     pub(crate) fn last_insert_id(&self) -> i64 {
         self.last_insert.get()

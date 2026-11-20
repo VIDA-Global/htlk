@@ -548,6 +548,16 @@ impl Connection {
             Self::Disabled => Err(Error::Invalid),
         }
     }
+    pub(crate) fn affected_rows(&self) -> u64 {
+        match self {
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(db) => db.total_changes(),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(db) => db.affected_rows(),
+            #[cfg(not(any(feature = "sqlite", feature = "postgres")))]
+            Self::Disabled => 0,
+        }
+    }
     #[cfg(feature = "postgres")]
     pub(crate) fn is_postgres(&self) -> bool {
         matches!(self, Self::Postgres(_))

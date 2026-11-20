@@ -612,6 +612,7 @@ async fn measure(config: Config) -> Result<()> {
             engine_config.clone(),
         )?);
     }
+    let before: Vec<_> = stores.iter().map(Store::write_metrics).collect();
     let parked = if let Some((work, fingerprint)) = parked_graph {
         mixed::park(
             &runtimes[0],
@@ -742,9 +743,15 @@ async fn measure(config: Config) -> Result<()> {
         recovery::samples(&database, &reader, registry, &config, graph.fingerprint).await?;
     }
     reader.close().await?;
-    for store in stores {
-        store.close().await?;
+    let (mut write_operations, mut affected_rows) = (0, 0);
+    for (store, before) in stores.into_iter().zip(before) {
+        store.clone().close().await?;
+        let after = store.write_metrics();
+        write_operations += after.operations - before.operations;
+        affected_rows += after.rows - before.rows;
     }
+    println!("metadata,write_operations,{write_operations}");
+    println!("metadata,affected_rows,{affected_rows}");
     if let (Some(before), Some(after)) = (initial_bytes, database.sqlite_bytes()?) {
         println!(
             "metadata,sqlite_growth_bytes,{}",

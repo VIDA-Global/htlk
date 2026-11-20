@@ -108,6 +108,18 @@ pub struct Store {
 /// Runtime consumers use [`Store`] without coupling execution to a database driver.
 pub type SqliteStore = Store;
 
+/// Advisory counters for successful, row-changing storage operations on one
+/// connection. Read transactions and operations reporting an error are excluded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreWriteMetrics {
+    /// Acknowledged worker calls that affected one or more rows. A call may
+    /// contain multiple logical transitions.
+    pub operations: u64,
+    /// Driver-reported affected rows in those calls. Trigger and savepoint
+    /// accounting can vary by backend; this is not a count of disk writes.
+    pub rows: u64,
+}
+
 #[cfg(feature = "postgres")]
 pub use crate::store_postgres::{PostgresConfig, PostgresStore};
 
@@ -191,6 +203,12 @@ impl Store {
     /// Returns the host-selected bounded database settings.
     pub fn config(&self) -> &StoreConfig {
         &self.config
+    }
+    /// Samples connection-local, cumulative write counters. Clones share the
+    /// counters; independently opened connections report separately. Sample at
+    /// quiescence for a consistent operation/row pair.
+    pub fn write_metrics(&self) -> StoreWriteMetrics {
+        self.connection.write_metrics()
     }
     /// Closes this connection and its clones after queued operations finish.
     /// Separately opened database connections remain usable.
