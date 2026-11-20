@@ -52,6 +52,8 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ### Fixed
 
+- The interactive guide retries transient inspection conflicts while waiting for
+  a run to finish or open a request, instead of failing an otherwise valid lesson.
 - PostgreSQL COMMIT warnings, including cancellation of a synchronous replication
   wait, return `StoreError::CommitUnknown` and invalidate the connection instead of
   issuing an ordinary success receipt. Initialization/opening use the same guarded
