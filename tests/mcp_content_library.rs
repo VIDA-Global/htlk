@@ -1,5 +1,7 @@
 //! Source-to-actor content helpers preserve actual checks and argument protection.
 
+#[path = "support/inspection.rs"]
+mod inspection_poll;
 #[allow(dead_code)]
 mod support;
 use htlk::compiler::Compiler;
@@ -9,14 +11,19 @@ use htlk::runtime::{
     failure::{FailureCode, RuntimeFailure},
     link_mcp_content_library,
     records::{InputValue, RunStatus, SecurityLabels},
-    store::{SqliteStore, StoreConfig},
+    store::StoreConfig,
 };
 use htlk_executable::{
     Identifier, JsonDocument,
     cbor::{Limits, Value},
     digest::Digest,
 };
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use support::store::{TestStore, io_budget_ms, lease_ms};
 
 struct Policy;
 impl RuntimePolicy for Policy {
@@ -65,13 +72,19 @@ fn source_calls_content_helpers_with_checked_narrowing_and_no_protection_downgra
           "extraction":{"status":"selected","selected_candidate_id":"candidate_0","candidates":[{"id":"candidate_0","value":{"title":"Store"},"validation":"parsed","sources":[{"origin":"structured_content","method":"structured_content"}]}]},
           "data":{"title":"Store"},"validation":{"declared_schema":{"status":"not_configured"},"inferred_schema":{"status":"not_configured"},"application_schema":{"status":"not_configured"}}
         }"#, &limits).unwrap();
-        let runtime = Arc::new(Runtime::new(SqliteStore::in_memory(StoreConfig::default()).await.unwrap(), Arc::new(registry), Arc::new(Policy), RuntimeConfig::default()).unwrap());
+        let runtime = Arc::new(Runtime::new(TestStore::in_memory(StoreConfig::default()).await.unwrap(), Arc::new(registry), Arc::new(Policy), RuntimeConfig::default()).unwrap());
         let owner = HostContext::new("owner".into(), &limits).unwrap();
         runtime.register_graph(&owner, &graph.executable_bytes, &[]).await.unwrap();
-        let engine = ExecutionEngine::launch(runtime.clone(), ExecutionConfig { poll_interval: Duration::from_millis(1), ..Default::default() }).unwrap();
+        let engine = ExecutionEngine::launch(runtime.clone(), ExecutionConfig { poll_interval: Duration::from_millis(1), lease_ms: lease_ms(1000), ..Default::default() }).unwrap();
         let started = runtime.start_run(&owner, graph.fingerprint, &BTreeMap::from([("response".parse().unwrap(), InputValue::Inline(input.value().clone()))]), "start", None).await.unwrap();
-        let view = tokio::time::timeout(Duration::from_secs(10), async {
-            loop { let view = runtime.inspect_run(&owner, &started.run_id).await.unwrap(); if view.header.status.is_terminal() { break view; } actix::clock::sleep(Duration::from_millis(2)).await; }
+        let timeout = Duration::from_millis(io_budget_ms(10_000));
+        let deadline = Instant::now() + timeout;
+        let view = tokio::time::timeout(timeout, async {
+            loop {
+                let view = inspection_poll::inspect_when_stable(&runtime, &owner, &started.run_id, deadline).await;
+                if view.header.status.is_terminal() { break view; }
+                actix::clock::sleep(Duration::from_millis(2)).await;
+            }
         }).await.unwrap();
         assert_eq!(view.header.status, RunStatus::Succeeded, "{view:#?}");
         let Value::Map(outputs) = view.outputs.unwrap() else { panic!() };

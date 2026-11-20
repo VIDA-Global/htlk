@@ -4,6 +4,23 @@
 use htlk_runtime::store::{Store, StoreConfig, StoreError};
 use std::{ops::Deref, path::Path};
 
+#[cfg(feature = "postgres")]
+fn postgres_url() -> String {
+    std::env::var("HTLK_TEST_POSTGRES_URL")
+        .expect("PostgreSQL tests require HTLK_TEST_POSTGRES_URL")
+}
+
+// The synchronous client has its own Tokio runtime. Keep it off test runtimes.
+#[cfg(feature = "postgres")]
+fn with_postgres<R: Send + 'static>(
+    work: impl FnOnce(&mut postgres::Client) -> Result<R, postgres::Error> + Send + 'static,
+) -> Result<R, postgres::Error> {
+    let url = postgres_url();
+    std::thread::spawn(move || work(&mut postgres::Client::connect(&url, postgres::NoTls)?))
+        .join()
+        .expect("PostgreSQL test worker panicked")
+}
+
 #[derive(Clone)]
 pub struct TestStore(Store);
 impl TestStore {
@@ -41,9 +58,7 @@ impl TestStore {
     #[cfg(feature = "postgres")]
     async fn postgres(identity: &[u8], config: StoreConfig) -> Result<Self, StoreError> {
         use htlk_runtime::store::{PostgresConfig, PostgresStore};
-        let url = std::env::var("HTLK_TEST_POSTGRES_URL")
-            .expect("PostgreSQL tests require HTLK_TEST_POSTGRES_URL");
-        let mut settings = PostgresConfig::new(url);
+        let mut settings = PostgresConfig::new(postgres_url());
         settings.schema = schema(identity);
         PostgresStore::initialize(settings, config)
             .await
@@ -66,16 +81,11 @@ pub fn postgres_admin<R: Send + 'static>(
     work: impl FnOnce(&mut postgres::Client) -> R + Send + 'static,
 ) -> R {
     let schema = schema(path.as_ref().as_os_str().as_encoded_bytes());
-    let url = std::env::var("HTLK_TEST_POSTGRES_URL").unwrap();
-    std::thread::spawn(move || {
-        let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
-        client
-            .batch_execute(&format!("SET search_path TO \"{schema}\", pg_catalog"))
-            .unwrap();
-        work(&mut client)
+    with_postgres(move |client| {
+        client.batch_execute(&format!("SET search_path TO \"{schema}\", pg_catalog"))?;
+        Ok(work(client))
     })
-    .join()
-    .expect("PostgreSQL independent inspector panicked")
+    .expect("PostgreSQL independent inspector could not open the schema")
 }
 
 pub fn remove_file(path: impl AsRef<Path>) -> std::io::Result<()> {
@@ -83,16 +93,10 @@ pub fn remove_file(path: impl AsRef<Path>) -> std::io::Result<()> {
         #[cfg(feature = "postgres")]
         {
             let schema = schema(path.as_ref().as_os_str().as_encoded_bytes());
-            let url = std::env::var("HTLK_TEST_POSTGRES_URL").unwrap();
-            return std::thread::spawn(move || {
-                let mut client = postgres::Client::connect(&url, postgres::NoTls)
-                    .map_err(std::io::Error::other)?;
-                client
-                    .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
-                    .map_err(std::io::Error::other)
+            return with_postgres(move |client| {
+                client.batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
             })
-            .join()
-            .expect("PostgreSQL cleanup worker panicked");
+            .map_err(std::io::Error::other);
         }
         #[cfg(not(feature = "postgres"))]
         panic!("PostgreSQL cleanup requires the postgres feature");
