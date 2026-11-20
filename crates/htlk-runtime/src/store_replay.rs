@@ -156,6 +156,26 @@ impl ReplayState {
             }
             JournalEvent::RunCreated => return Err(StoreError::Corrupt),
             JournalEvent::RunInitialized => self.apply_initial(entry, limits)?,
+            JournalEvent::OwnershipParked => {
+                let [owner, fence, wake] = array::<3>(&entry.payload)?;
+                let lease = RunLease {
+                    run_id: entry.run_id.clone(),
+                    owner: string(owner)?.into(),
+                    fence: integer(fence)?,
+                };
+                if self.header.status.is_terminal()
+                    || lease.owner != entry.actor
+                    || entry.command_id.is_some()
+                    || entry.causation != "ownership"
+                    || integer(wake)? < entry.timestamp_ms
+                {
+                    return Err(StoreError::Corrupt);
+                }
+                check_authority(&self.header, &lease, entry.timestamp_ms)
+                    .map_err(|_| StoreError::Corrupt)?;
+                self.header.owner = None;
+                self.header.expires_at_ms = None;
+            }
             JournalEvent::OwnershipAcquired | JournalEvent::OwnershipRenewed => {
                 if self.header.status.is_terminal() || entry.command_id.is_some() {
                     return Err(StoreError::Corrupt);

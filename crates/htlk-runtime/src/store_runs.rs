@@ -150,18 +150,20 @@ impl HostRequest {
         Ok(())
     }
 }
-fn normalize_time(tx: &rusqlite::Transaction<'_>, observed: i64) -> Result<i64, StoreError> {
+pub(super) fn observed_time(db: &rusqlite::Connection, observed: i64) -> Result<i64, StoreError> {
     timestamp(observed)?;
-    let watermark: i64 = tx.query_row(
-        "SELECT last_time_ms FROM runtime_identity WHERE singleton=1",
+    let (watermark, committed): (i64, i64) = db.query_row(
+        "SELECT last_time_ms,(SELECT coalesce(max(last_time_ms),0) FROM runs) FROM runtime_identity WHERE singleton=1",
         [],
-        |r| r.get(0),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    let committed: i64 =
-        tx.query_row("SELECT coalesce(max(last_time_ms),0) FROM runs", [], |r| {
-            r.get(0)
-        })?;
-    let now = observed.max(watermark).max(committed);
+    Ok(observed.max(watermark).max(committed))
+}
+pub(super) fn normalize_time(
+    tx: &rusqlite::Transaction<'_>,
+    observed: i64,
+) -> Result<i64, StoreError> {
+    let now = observed_time(tx, observed)?;
     tx.execute(
         "UPDATE runtime_identity SET last_time_ms=?1 WHERE singleton=1",
         [now],

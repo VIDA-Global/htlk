@@ -5,6 +5,12 @@ import { createInterface } from 'node:readline';
 import { appendFileSync, readFileSync } from 'node:fs';
 
 const [transport, mode, log] = process.argv.slice(2);
+const delayMs = mode.startsWith('perf-') ? Number(mode.slice(5)) : 0;
+async function delayTool(request) {
+  if (delayMs > 0 && request.method === 'tools/call') {
+    await new Promise(resolve => setTimeout(resolve, delayMs));
+  }
+}
 const tool = {
   name: 'echo',
   inputSchema: { type: 'object', properties: { value: { type: ['string', 'null'] } }, required: ['value'], additionalProperties: false },
@@ -90,7 +96,9 @@ function reply(request, server = 'research') {
 
 if (transport === 'stdio') {
   for await (const line of createInterface({ input: process.stdin })) {
-    const response = reply(JSON.parse(line));
+    const message = JSON.parse(line);
+    if (delayMs > 0) await delayTool(message);
+    const response = reply(message);
     if (response) process.stdout.write(response + '\n');
   }
 } else {
@@ -99,6 +107,7 @@ if (transport === 'stdio') {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
     const message = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    if (delayMs > 0) await delayTool(message);
     const body = reply(message, request.headers['x-fixture-server']);
     if (body === null) {
       // Keep the operation pending until the test kills the peer or worker.

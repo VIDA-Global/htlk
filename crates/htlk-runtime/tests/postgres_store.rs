@@ -393,10 +393,52 @@ fn a_database_lock_timeout_rolls_back_and_the_same_connection_remains_usable() {
         });
         locked.await.unwrap();
         let at = Instant::now();
-        assert_eq!(store.run_header(&run.run_id).await,Err(StoreError::Database));
+        assert_eq!(store.run_header(&run.run_id).await.unwrap().sequence,1);
+        let pin=store.inspection_position().await.unwrap();
+        assert_eq!(store.open_inspection_snapshot(&run.run_id,Some(&pin)).await.unwrap().header().sequence,1);
+        assert_eq!(store.acquire(&run.run_id,"blocked".into(),2,100).await,Err(StoreError::Database));
         assert!(at.elapsed()<Duration::from_secs(1));
         release.send(()).unwrap(); locker.join().unwrap();
         assert_eq!(store.run_header(&run.run_id).await.unwrap().sequence,1);
+        store.close().await.unwrap();
+    });
+}
+
+#[test]
+fn a_locked_run_does_not_block_a_disjoint_writer_or_pinned_reader() {
+    use std::{sync::mpsc, time::Duration};
+    actix::System::new().block_on(async {
+        let mut settings = settings();
+        settings.lock_timeout = Duration::from_millis(150);
+        let store = PostgresStore::initialize(settings.clone(), StoreConfig::default()).await.unwrap();
+        let first = seed();
+        let mut second = seed();
+        second.run_id = RunId::new("independent".into(), &Limits::default()).unwrap();
+        second.root_scope = ScopeInstanceId::root(&second.run_id, &Limits::default()).unwrap();
+        store.create_run(first.clone()).await.unwrap();
+        store.create_run(second.clone()).await.unwrap();
+        let pin = store.inspection_position().await.unwrap();
+        let schema = settings.schema;
+        let url = std::env::var("HTLK_TEST_POSTGRES_URL").unwrap();
+        let (ready, locked) = tokio::sync::oneshot::channel();
+        let (release, held) = mpsc::channel();
+        let bytes = first.run_id.as_str().as_bytes().to_vec();
+        let locker = std::thread::spawn(move || {
+            let mut db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+            db.batch_execute(&format!("SET search_path TO \"{schema}\",pg_catalog;BEGIN;SELECT pg_advisory_xact_lock_shared(hashtextextended(current_database() || ':' || current_schema(),1213484107));")).unwrap();
+            db.query_one("SELECT sequence FROM runs WHERE run_id=$1 FOR UPDATE", &[&bytes]).unwrap();
+            ready.send(()).unwrap();
+            let _ = held.recv_timeout(Duration::from_secs(5));
+            db.batch_execute("ROLLBACK").unwrap();
+        });
+        locked.await.unwrap();
+        assert_eq!(store.acquire(&first.run_id, "held".into(), 2, 100).await, Err(StoreError::Database));
+        let lease = store.acquire(&second.run_id, "free".into(), 2, 100).await.unwrap();
+        assert_eq!(store.commit(&lease, proposal("free", None)).await.unwrap().sequence, 3);
+        assert_eq!(store.open_inspection_snapshot(&second.run_id, Some(&pin)).await.unwrap().header().sequence, 1);
+        release.send(()).unwrap();
+        locker.join().unwrap();
+        assert_eq!(store.inspection_position().await.unwrap().number(), pin.number()+2);
         store.close().await.unwrap();
     });
 }

@@ -3,7 +3,7 @@
 use crate::{
     sqlite_worker,
     store::{Store, StoreConfig, StoreError},
-    store_db::{self, Error, Value},
+    store_db::{self, Error, OperationMode, Value},
     store_postgres_client::{Client, Error as ClientError},
 };
 use postgres::types::{ToSql, Type};
@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const APPLICATION_ID: &str = "htlk.runtime.postgres";
 const SCHEMA: &str = include_str!("store_postgres.sql");
 
@@ -282,7 +282,7 @@ impl Database {
             inspection_position: Cell::new(None),
         })
     }
-    pub(crate) fn begin(&self) -> store_db::Result<()> {
+    pub(crate) fn begin(&self, mode: OperationMode) -> store_db::Result<()> {
         if self.broken.get() {
             return Err(Error::Database);
         }
@@ -292,8 +292,16 @@ impl Database {
             .set_deadline(Some(Instant::now() + self.settings.operation_timeout));
         self.cursor_failed.set(false);
         self.inspection_position.set(None);
-        self.batch("BEGIN ISOLATION LEVEL READ COMMITTED")?;
-        if let Err(error) = self.batch("SELECT pg_advisory_xact_lock(hashtextextended(current_database() || ':' || current_schema(), 1213484107))") {
+        let result = match mode {
+            OperationMode::Read => self.batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"),
+            OperationMode::Exclusive => self.batch("BEGIN ISOLATION LEVEL READ COMMITTED; SELECT pg_advisory_xact_lock(hashtextextended(current_database() || ':' || current_schema(), 1213484107))"),
+            OperationMode::Run(run) => self.batch("BEGIN ISOLATION LEVEL READ COMMITTED; SELECT pg_advisory_xact_lock_shared(hashtextextended(current_database() || ':' || current_schema(), 1213484107))").and_then(|()| {
+                // Gate before row lock; all narrowly gated writers take this
+                // lock before inspecting authority, revision or journal state.
+                self.query_one("SELECT sequence FROM runs WHERE run_id=?1 FOR UPDATE", vec![Value::Text(run)]).map(|_| ())
+            }),
+        };
+        if let Err(error) = result {
             let _ = self.client.borrow_mut().batch_execute("ROLLBACK");
             return Err(error);
         }

@@ -4,6 +4,7 @@ use super::{
     checkpoint::{InvocationCheckpoint, NodeCompletion},
     frame::Frame,
     model::*,
+    working,
 };
 use crate::{
     EvaluationValue, HostContext, Runtime, RuntimeError,
@@ -21,8 +22,8 @@ use crate::{
 };
 use htlk_analyzer::{ExpressionSite, ScopeUse};
 use htlk_executable::{
-    EdgeDestination, EdgeSource, ExecutionLimits, Identifier, Node, Operation, PortTable, Scope,
-    ValueReference,
+    EdgeDestination, EdgeSource, ExecutionLimits, ExpressionKind, Identifier, Node, Operation,
+    PortTable, ScalarLiteral, Scope, ValueReference,
     cbor::{self, Map, Value},
 };
 use std::{collections::BTreeMap, sync::Arc};
@@ -44,6 +45,7 @@ pub(super) struct ScopeState {
 pub(super) enum Progress {
     Changed,
     Blocked,
+    Quiescent { sequence: i64, wake_at: i64 },
     Terminal,
 }
 pub(super) async fn tick(runtime: Arc<Runtime>, lease: RunLease) -> Result<Progress, RuntimeError> {
@@ -60,18 +62,31 @@ async fn tick_observed(
     lease: RunLease,
     #[cfg(all(test, feature = "sqlite"))] probe: Option<&tests::Probe>,
 ) -> Result<Progress, RuntimeError> {
-    let header = runtime.store.run_header(lease.run_id()).await?;
+    let cached_sequence =
+        working::with(|set| set.scopes_complete.then_some(set.sequence)).flatten();
+    let page = runtime
+        .store
+        .scheduling_page(lease.run_id(), runtime.clock.now_ms()?, cached_sequence)
+        .await?;
+    let header = page.header;
     if header.status.is_terminal() {
         return Ok(Progress::Terminal);
     }
-    let now = runtime
-        .store
-        .coordinator_time(runtime.clock.now_ms()?)
-        .await?;
-    let mut cursor = None;
-    let mut scopes = Vec::new();
+    let now = page.now;
+    working::with(|set| {
+        if set.sequence != header.sequence {
+            set.reset(header.sequence);
+        }
+    });
+    let cached = cached_sequence == Some(header.sequence);
+    let mut scopes = if cached {
+        working::with(|set| set.scopes()).unwrap_or_default()
+    } else {
+        page.scopes
+    };
+    let mut cursor = scopes.last().map(|r| r.key.id.clone());
     let mut wake_at = i64::MAX;
-    loop {
+    while !cached && cursor.is_some() {
         let page = runtime
             .store
             .records(
@@ -86,6 +101,17 @@ async fn tick_observed(
         }
         cursor = page.last().map(|r| r.key.id.clone());
         scopes.extend(page);
+    }
+    if !cached {
+        working::with(|set| {
+            set.scopes_complete = true;
+            for scope in &scopes {
+                if !set.retain(scope.clone(), &runtime.config.limits) {
+                    set.scopes_complete = false;
+                    break;
+                }
+            }
+        });
     }
     for record in scopes {
         if record.final_record
@@ -124,9 +150,7 @@ async fn tick_observed(
         for node in &scope.definition.fields().nodes {
             let invocation =
                 InvocationId::new(id, node.id(), &runtime.config.limits).map_err(|_| err())?;
-            match runtime
-                .store
-                .record(lease.run_id(), &key(RecordFamily::Invocation, invocation))
+            match scheduling_record(&runtime, &lease, &key(RecordFamily::Invocation, invocation))
                 .await
             {
                 Ok(record) => {
@@ -227,6 +251,9 @@ async fn tick_observed(
                 .await?;
                 return Ok(Progress::Changed);
             }
+            if working::with(|set| set.waiting(&record.key.id)) == Some(true) {
+                continue;
+            }
             let changed =
                 if InvocationCheckpoint::parse(record, &runtime.config.limits)?.is_pending() {
                     admit(&runtime, &lease, &scope, definition, record).await?
@@ -282,7 +309,10 @@ async fn tick_observed(
             observations.pop_first();
         }
         observations.insert(lease.run_id().clone(), (header.sequence, wake_at));
-        return Ok(Progress::Blocked);
+        return Ok(Progress::Quiescent {
+            sequence: header.sequence,
+            wake_at,
+        });
     }
     Err(RuntimeError::failure(FailureCode::Invariant))
 }
@@ -297,9 +327,22 @@ pub(super) async fn commit(
         .store
         .coordinator_time(runtime.clock.now_ms()?)
         .await?;
-    runtime
+    let retained = working::with(|_| {
+        writes
+            .iter()
+            .filter(|write| {
+                matches!(
+                    write.key.family,
+                    RecordFamily::Invocation | RecordFamily::Guard | RecordFamily::Scope
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    let sequence = working::with(|set| set.sequence).filter(|sequence| *sequence > 0);
+    let receipt = runtime
         .store
-        .commit(
+        .commit_at_sequence(
             lease,
             Transition {
                 context: TransitionContext {
@@ -313,9 +356,26 @@ pub(super) async fn commit(
                 root: None,
                 expected_fingerprint: None,
             },
+            sequence,
         )
         .await?;
+    if let Some(retained) = retained {
+        working::with(|set| set.committed(receipt.sequence, retained, &runtime.config.limits));
+    }
     Ok(())
+}
+
+async fn scheduling_record(
+    runtime: &Runtime,
+    lease: &RunLease,
+    key: &crate::store::RecordKey,
+) -> Result<StoredRecord, StoreError> {
+    if let Some(record) = working::with(|set| set.get(key)).flatten() {
+        return Ok(record);
+    }
+    let record = runtime.store.record(lease.run_id(), key).await?;
+    working::with(|set| set.retain(record.clone(), &runtime.config.limits));
+    Ok(record)
 }
 fn due(value: &Value, now: i64) -> Result<bool, RuntimeError> {
     Ok(matches!(map(value)?.get("deadline_ms"),Some(Value::Integer(deadline))if now>=*deadline))
@@ -404,11 +464,7 @@ async fn guard(
     site: ExpressionSite,
     id: String,
 ) -> Result<(GuardEvaluation, Option<RecordWrite>), RuntimeError> {
-    match runtime
-        .store
-        .record(lease.run_id(), &key(RecordFamily::Guard, &id))
-        .await
-    {
+    match scheduling_record(runtime, lease, &key(RecordFamily::Guard, &id)).await {
         Ok(record) => {
             let state = match field(&record.payload, "value")? {
                 Value::Bool(v) => GuardState::Value(*v),
@@ -656,7 +712,36 @@ async fn admit(
     )
     .map_err(|_| err())?;
     let influence = match gate {
-        AdmissionDecision::Pending => return Ok(false),
+        AdmissionDecision::Pending => {
+            // Only index a known selected pending source behind recorded,
+            // unconditional guards. Unsettled conditional guards stay on the
+            // ordinary reducer so lazy evaluation and error order do not change.
+            if matches!(
+                node.fields().guard.kind(),
+                ExpressionKind::Literal(ScalarLiteral::Boolean(true))
+            ) {
+                for (port, decision) in &selected {
+                    if !decision.is_pending() {
+                        continue;
+                    }
+                    let mut edges = scope.definition.fields().edges.iter().filter(|edge| matches!(edge.destination(), EdgeDestination::Input { node: dest, port: target } if dest == node.id() && target == port));
+                    if let Some(edge) = edges.next()
+                        && edges.next().is_none()
+                        && matches!(
+                            edge.guard().kind(),
+                            ExpressionKind::Literal(ScalarLiteral::Boolean(true))
+                        )
+                        && let EdgeSource::Output { node: producer, .. } = edge.source()
+                        && let Some(producer) = scope.nodes.get(producer)
+                        && !producer.final_record
+                    {
+                        working::with(|set| set.defer(&record.key.id, &producer.key.id));
+                        break;
+                    }
+                }
+            }
+            return Ok(false);
+        }
         AdmissionDecision::InputsFailed {
             failures,
             influence,

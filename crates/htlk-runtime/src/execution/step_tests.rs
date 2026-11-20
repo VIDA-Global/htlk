@@ -213,7 +213,7 @@ async fn waiting_run() -> (Arc<Runtime>, HostContext, RunLease, WaitId) {
     for _ in 0..32 {
         match tick(runtime.clone(), lease.clone()).await.unwrap() {
             Progress::Changed => {}
-            Progress::Blocked => {
+            Progress::Blocked | Progress::Quiescent { .. } => {
                 let waits = super::super::control::all(&runtime, &lease, RecordFamily::Wait)
                     .await
                     .unwrap();
@@ -531,7 +531,7 @@ fn stable_open_wait_blocks_but_stable_impossible_wait_state_still_fails_invarian
         let before = runtime.store.run_header(lease.run_id()).await.unwrap();
         assert!(matches!(
             tick(runtime.clone(), lease.clone()).await.unwrap(),
-            Progress::Blocked
+            Progress::Quiescent { .. }
         ));
         assert_eq!(
             runtime.store.run_header(lease.run_id()).await.unwrap(),

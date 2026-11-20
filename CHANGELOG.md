@@ -6,8 +6,26 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ## [Unreleased]
 
+### Added
+
+- Repeatable release-mode performance campaigns for durable SQLite and PostgreSQL,
+  with raw timing samples and correctness checks under load.
+
 ### Changed
 
+- PostgreSQL scheduling and historical reads use ungated repeatable-read snapshots.
+  Ordinary single-run writes coordinate on the run row and order publication at
+  the inspection clock. Hosts can route independent SQLite or PostgreSQL stores
+  with per-store inspection positions.
+- Quiescent runs without MCP attempt state park durably and release their active
+  slot. Host commands reacquire parked runs under a higher fence; indexed deadlines
+  wake them without per-run polling. Requires SQLite schema 16 or PostgreSQL layout 3.
+- Active coordinators reuse a bounded committed working set on both backends.
+  Successive decisions refresh changed checkpoint metadata, defer known pending
+  unconditional dependencies, and recheck the observed journal sequence at commit.
+- The SQLite layout uses indexed artifact-expiry and running-run lookups (schema
+  15). Both backends read the first scheduling page with the header and advisory
+  clock in one storage operation. Native implementation identities change.
 - Historical runtime inspection uses committed version projections on both backends:
   SQLite schema 14 and PostgreSQL layout 2 reject older stores without migration or
   deletion. Native implementation identities and executable fingerprints change.

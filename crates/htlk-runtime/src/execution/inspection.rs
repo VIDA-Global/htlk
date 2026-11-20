@@ -327,13 +327,16 @@ impl Runtime {
             });
         }
         let now = self.clock.now_ms()?.max(header.last_time_ms);
+        let observed_blocked = self
+            .quiescent
+            .lock()
+            .map_err(|_| err())?
+            .get(run)
+            .is_some_and(|(sequence, wake_at)| *sequence == header.sequence && now < *wake_at);
         let blocked = header.status == RunStatus::Running
-            && self
-                .quiescent
-                .lock()
-                .map_err(|_| err())?
-                .get(run)
-                .is_some_and(|(sequence, wake_at)| *sequence == header.sequence && now < *wake_at);
+            && (observed_blocked
+                || (header.owner.is_none()
+                    && self.store.parked_at(run, header.sequence, now).await?));
         let outputs = if header.status == RunStatus::Succeeded
             && string(&root.payload, "status")? == "succeeded"
         {

@@ -23,6 +23,7 @@ runtime, and MCP rules, with machine-readable grammar/schema assets. The
 
 - [Contributing](../CONTRIBUTING.md): prerequisites, Rust conventions, and releases.
 - [Testing](testing.md): check commands, conformance map, coverage, and fixtures.
+- [Performance](performance.md): repeatable workloads, metrics, and local baseline results.
 - [MCP client conformance](mcp-conformance.md): version-specific native support and qualification gaps.
 - [Sibling MCP interoperability](mcp-interoperability-2026-11-06.md): dated real-server results and remaining upstream findings.
 - [Runtime internals](runtime-internals.md): private persistence and concurrency invariants.

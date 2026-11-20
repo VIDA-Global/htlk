@@ -261,7 +261,12 @@ fn killed_workers_resume_real_response_intent_wait_and_loop_checkpoints_without_
             let (compiler,registry)=configuration(marker.clone(),false);let graph=compiler.compile_source(&source(mode),&e2e::catalogs("streamable_http")).unwrap();assert_eq!(graph.fingerprint,before.fingerprint);
             // No adapter is installed in the recovering service: a saved response
             // must be accepted locally and an unsafe intent must remain uncertain.
-            let runtime=Arc::new(Runtime::new(store.clone(),Arc::new(registry),Arc::new(e2e::Policy),RuntimeConfig::default()).unwrap().with_clock(Arc::new(Clock(before.expires_at_ms.unwrap()+1))));
+            if before.expires_at_ms.is_none() {
+                assert!(matches!(mode, "wait" | "loop") && wait.is_some());
+                assert_eq!(store.journal(&run, before.sequence - 1, 1).await.unwrap()[0].event, store::JournalEvent::OwnershipParked);
+            }
+            let takeover_time = before.expires_at_ms.unwrap_or(before.last_time_ms) + 1;
+            let runtime=Arc::new(Runtime::new(store.clone(),Arc::new(registry),Arc::new(e2e::Policy),RuntimeConfig::default()).unwrap().with_clock(Arc::new(Clock(takeover_time))));
             let engine=ExecutionEngine::launch(runtime.clone(),ExecutionConfig{scope:ExecutionScope::Attached,lease_ms:100,poll_interval:Duration::from_millis(2),..Default::default()}).unwrap();
             actix::clock::sleep(Duration::from_millis(10)).await;
             assert_eq!(store.run_header(&run).await.unwrap(),before,"opening the recovery engine must not select the killed worker's run");

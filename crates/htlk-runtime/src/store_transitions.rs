@@ -114,6 +114,8 @@ pub enum JournalEvent {
     OwnershipAcquired,
     /// Same owner/fence with renewed expiry.
     OwnershipRenewed,
+    /// A verified quiescent run released the live owner until an external wake or timer.
+    OwnershipParked,
     /// Complete revisioned records and optional terminal/root update.
     RecordsCommitted,
 }
@@ -126,6 +128,7 @@ impl JournalEvent {
             "run_created" => Ok(Self::RunCreated),
             "ownership_acquired" => Ok(Self::OwnershipAcquired),
             "ownership_renewed" => Ok(Self::OwnershipRenewed),
+            "ownership_parked" => Ok(Self::OwnershipParked),
             "records_committed" => Ok(Self::RecordsCommitted),
             _ => Err(StoreError::Corrupt),
         }
@@ -180,16 +183,28 @@ impl SqliteStore {
         lease: &RunLease,
         transition: Transition,
     ) -> Result<CommitReceipt, StoreError> {
+        self.commit_at_sequence(lease, transition, None).await
+    }
+
+    pub(crate) async fn commit_at_sequence(
+        &self,
+        lease: &RunLease,
+        transition: Transition,
+        sequence: Option<i64>,
+    ) -> Result<CommitReceipt, StoreError> {
         let limits = self.config.limits.clone();
         let prepared = PreparedTransition::new(lease, transition, &limits)?;
         let lease = lease.clone();
         self.connection
-            .call(move |db| -> Result<CommitReceipt, StoreError> {
-                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let receipt = prepared.apply(&tx, &lease, &limits)?;
-                tx.commit()?;
-                Ok(receipt)
-            })
+            .write_run(
+                lease.run_id().to_string(),
+                move |db| -> Result<CommitReceipt, StoreError> {
+                    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    let receipt = prepared.apply_at_sequence(&tx, &lease, &limits, sequence)?;
+                    tx.commit()?;
+                    Ok(receipt)
+                },
+            )
             .await
             .map_err(StoreError::from_worker)
     }
@@ -200,7 +215,7 @@ impl SqliteStore {
     pub async fn record(&self, run: &RunId, key: &RecordKey) -> Result<StoredRecord, StoreError> {
         self.check_text(&key.id)?;
         let (run, key, limits) = (run.clone(), key.clone(), self.config.limits.clone());
-        self.connection.call(move |db|->Result<StoredRecord,StoreError>{
+        self.connection.read(move |db|->Result<StoredRecord,StoreError>{
             let mut statement=db.prepare("SELECT revision,final,payload FROM records WHERE run_id=?1 AND family=?2 AND record_id=?3")?;
             let mut rows=statement.query(params![run.as_str(),key.family.as_str(),key.id])?;
             let row=rows.next()?.ok_or(StoreError::Missing)?;
@@ -238,7 +253,7 @@ impl SqliteStore {
             return Err(StoreError::Invalid);
         }
         let (run, limits) = (run.clone(), self.config.limits.clone());
-        self.connection.call(move |db|->Result<Vec<JournalEntry>,StoreError>{
+        self.connection.read(move |db|->Result<Vec<JournalEntry>,StoreError>{
             let mut statement=db.prepare("SELECT sequence,event_type,record_version,actor,timestamp_ms,causation,command_id,payload FROM journal WHERE run_id=?1 AND sequence>?2 AND sequence<=?4 ORDER BY sequence LIMIT ?3")?;
             let mut rows=statement.query(params![run.as_str(),after,count,through])?;
             let mut result=Vec::new();
@@ -427,6 +442,16 @@ impl PreparedTransition {
         lease: &RunLease,
         limits: &Limits,
     ) -> Result<CommitReceipt, StoreError> {
+        self.apply_at_sequence(tx, lease, limits, None)
+    }
+
+    fn apply_at_sequence(
+        self,
+        tx: &rusqlite::Transaction<'_>,
+        lease: &RunLease,
+        limits: &Limits,
+        sequence: Option<i64>,
+    ) -> Result<CommitReceipt, StoreError> {
         let Self {
             transition,
             request_digest,
@@ -436,6 +461,9 @@ impl PreparedTransition {
         let header = load_header(tx, &lease.run_id)?;
         let now = transition.context.timestamp_ms.max(header.last_time_ms);
         check_authority(&header, lease, now)?;
+        if sequence.is_some_and(|expected| header.sequence != expected) {
+            return Err(StoreError::Conflict);
+        }
         let old = tx
             .query_row(
                 "SELECT request_digest,sequence FROM commands WHERE run_id=?1 AND command_id=?2",

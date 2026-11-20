@@ -286,6 +286,12 @@ pub(crate) enum TransactionBehavior {
     Immediate,
 }
 
+pub(crate) enum OperationMode {
+    Exclusive,
+    Read,
+    Run(String),
+}
+
 impl Connection {
     pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self> {
         #[cfg(feature = "sqlite")]
@@ -527,15 +533,24 @@ impl Connection {
             Self::Disabled => 0,
         }
     }
-    pub(crate) fn begin_operation(&self) -> Result<()> {
+    pub(crate) fn begin_operation(&self, mode: OperationMode) -> Result<()> {
+        #[cfg(not(feature = "postgres"))]
+        let _ = match &mode {
+            OperationMode::Run(run) => Some(run),
+            _ => None,
+        };
         match self {
             #[cfg(feature = "postgres")]
-            Self::Postgres(db) => db.begin(),
+            Self::Postgres(db) => db.begin(mode),
             #[cfg(feature = "sqlite")]
             Self::Sqlite(_) => Ok(()),
             #[cfg(not(any(feature = "sqlite", feature = "postgres")))]
             Self::Disabled => Err(Error::Invalid),
         }
+    }
+    #[cfg(feature = "postgres")]
+    pub(crate) fn is_postgres(&self) -> bool {
+        matches!(self, Self::Postgres(_))
     }
     pub(crate) fn finish_operation(&self, success: bool) -> Result<()> {
         match self {

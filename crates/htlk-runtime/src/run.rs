@@ -346,6 +346,7 @@ impl Runtime {
                 self.config.idempotency_retention_ms as i64,
             )
             .await?;
+        crate::execution::hint(self);
         Ok(RunStarted { run_id })
     }
 }

@@ -147,7 +147,7 @@ impl Store {
         id: crate::identity::ArtifactId,
     ) -> Result<InspectionSnapshot, StoreError> {
         let (at, limits) = (at.clone(), self.config.limits.clone());
-        self.connection.call(move |db| {
+        self.connection.read(move |db| {
             let pin = checked_position(db, Some(&at))?;
             let mut statement = db.prepare("SELECT k.run_id FROM records r JOIN inspection_record_keys k ON k.run_id=r.run_id AND k.family=r.family AND k.record_id=r.record_id WHERE r.family='artifact' AND r.record_id=?1 AND k.created_position<=?2")?;
             let mut rows = statement.query(params![id.to_string(),pin.position])?;
@@ -164,7 +164,7 @@ impl Store {
     /// Returns database or corrupt store identity failures.
     pub async fn inspection_position(&self) -> Result<StorePosition, StoreError> {
         self.connection
-            .call(|db| position(db, None))
+            .read(|db| position(db, None))
             .await
             .map_err(StoreError::from_worker)
     }
@@ -177,7 +177,7 @@ impl Store {
     /// Returns invalid negative/future positions, database or corrupt identity failures.
     pub async fn inspection_position_at(&self, number: i64) -> Result<StorePosition, StoreError> {
         self.connection
-            .call(move |db| position(db, Some(number)))
+            .read(move |db| position(db, Some(number)))
             .await
             .map_err(StoreError::from_worker)
     }
@@ -195,7 +195,7 @@ impl Store {
     ) -> Result<InspectionSnapshot, StoreError> {
         let (run, at, limits) = (run.clone(), at.cloned(), self.config.limits.clone());
         self.connection
-            .call(move |db| {
+            .read(move |db| {
                 let pin = checked_position(db, at.as_ref())?;
                 let (_, header) = historical_header(db, &run, pin.position, &limits)?;
                 Ok(InspectionSnapshot {
@@ -229,7 +229,7 @@ impl Store {
             return Err(StoreError::Invalid);
         }
         let (at, limits) = (at.cloned(), self.config.limits.clone());
-        self.connection.call(move |db| {
+        self.connection.read(move |db| {
             let pin = checked_position(db, at.as_ref())?;
             let (upper,_,_) = uppers(db,pin.position)?;
             let mut statement = db.prepare("SELECT run_number,run_id FROM inspection_runs WHERE run_number>?1 AND run_number<=?2 ORDER BY run_number LIMIT ?3")?;
@@ -275,7 +275,7 @@ impl Store {
             return Err(StoreError::Invalid);
         }
         let (snapshot, limits) = (snapshot.clone(), self.config.limits.clone());
-        self.connection.call(move |db| {
+        self.connection.read(move |db| {
             checked_position(db,Some(&snapshot.position))?;
             let (_,upper,_) = uppers(db,snapshot.position.position)?;
             // Bound candidate keys before looking up versions, rather than asking
@@ -307,7 +307,7 @@ impl Store {
     ) -> Result<StoredRecord, StoreError> {
         self.check_text(&key.id)?;
         let (snapshot, key, limits) = (snapshot.clone(), key.clone(), self.config.limits.clone());
-        self.connection.call(move |db| {
+        self.connection.read(move |db| {
             checked_position(db,Some(&snapshot.position))?;
             let number = db.query_row("SELECT record_number FROM inspection_record_keys WHERE run_id=?1 AND family=?2 AND record_id=?3",params![snapshot.header.run_id.as_str(),key.family.as_str(),key.id],|row| row.get(0))?;
             historical_record(db,number,key,snapshot.position.position,&limits)
@@ -328,7 +328,7 @@ impl Store {
         // Verify namespace before the shared bounded journal reader.
         let pin = snapshot.position.clone();
         self.connection
-            .call(move |db| checked_position(db, Some(&pin)))
+            .read(move |db| checked_position(db, Some(&pin)))
             .await
             .map_err(StoreError::from_worker)?;
         self.journal_until(
@@ -419,7 +419,7 @@ impl Store {
             return Err(StoreError::Invalid);
         }
         let (through, limits) = (through.cloned(), self.config.limits.clone());
-        self.connection.call(move |db| {
+        self.connection.read(move |db| {
             let pin = checked_position(db,through.as_ref())?;
             let (_,_,upper) = uppers(db,pin.position)?;
             let mut statement = db.prepare("SELECT c.change_id,c.position,r.run_id,k.family,k.record_id,c.sequence FROM inspection_changes c JOIN inspection_runs r ON r.run_number=c.run_number LEFT JOIN inspection_record_keys k ON k.record_number=c.record_number WHERE c.change_id>?1 AND c.change_id<=?2 ORDER BY c.change_id LIMIT ?3")?;
@@ -598,11 +598,16 @@ pub(super) fn project(
     let position = if let Some(position) = tx.inspection_position() {
         position
     } else {
-        let previous: i64 = tx.query_row(
-            "SELECT position FROM inspection_clock WHERE singleton=1",
-            [],
-            |r| r.get(0),
-        )?;
+        // Serialize publication until physical commit, after independent work
+        // has already run under its own run row lock.
+        let sql = "SELECT position FROM inspection_clock WHERE singleton=1";
+        #[cfg(feature = "postgres")]
+        let sql = if tx.is_postgres() {
+            "SELECT position FROM inspection_clock WHERE singleton=1 FOR UPDATE"
+        } else {
+            sql
+        };
+        let previous: i64 = tx.query_row(sql, [], |r| r.get(0))?;
         let position = previous.checked_add(1).ok_or(StoreError::Invalid)?;
         tx.execute(
             "UPDATE inspection_clock SET position=?1 WHERE singleton=1",
@@ -630,7 +635,7 @@ pub(super) fn project(
         "run_initialized" => array(&value)?.first(),
         "records_committed" => array(&value)?.get(2),
         "terminal_receipt" | "artifact_expired" => Some(&value),
-        "run_created" | "ownership_acquired" | "ownership_renewed" => None,
+        "run_created" | "ownership_acquired" | "ownership_renewed" | "ownership_parked" => None,
         _ => return Err(StoreError::Corrupt),
     };
     if let Some(body) = body {

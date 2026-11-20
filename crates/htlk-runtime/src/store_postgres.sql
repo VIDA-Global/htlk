@@ -1,4 +1,4 @@
--- Native PostgreSQL layout 2. Canonical CBOR remains authoritative.
+-- Native PostgreSQL layout 3. Canonical CBOR remains authoritative.
 -- Arbitrary UTF-8 identities are BYTEA (including NUL). Generated SHA-256 keys
 -- bound B-tree entries without narrowing admitted identity sizes. The preimage
 -- registry rejects collisions before any ON CONFLICT operation can conflate keys.
@@ -53,12 +53,14 @@ CREATE TABLE runs (
     owner BYTEA,
     fence BIGINT NOT NULL CHECK(fence>=0),
     lease_expires_ms BIGINT,
+    eligible_at_ms BIGINT NOT NULL DEFAULT 0 CHECK(eligible_at_ms>=0),
     last_time_ms BIGINT NOT NULL CHECK(last_time_ms>=0),
     CHECK((owner IS NULL)=(lease_expires_ms IS NULL))
 );
 CREATE TRIGGER runs_keys BEFORE INSERT OR UPDATE OF run_id ON runs
     FOR EACH ROW EXECUTE FUNCTION htlk_check_keys('run_id');
 CREATE INDEX committed_run_time ON runs(last_time_ms);
+CREATE INDEX ready_run_ids ON runs(eligible_at_ms,run_id) WHERE status='running';
 CREATE TABLE journal (
     run_id BYTEA NOT NULL,
     run_key BYTEA GENERATED ALWAYS AS (sha256(run_id)) STORED REFERENCES runs(run_key),

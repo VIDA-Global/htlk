@@ -16,7 +16,7 @@ use htlk_executable::{
 };
 use std::{fmt, path::Path, time::Duration};
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 16;
 const APPLICATION_ID: i64 = 0x48544c4b;
 const SCHEMA: &str = include_str!("store.sql");
 const REGISTRATION_SCHEMA: &str = include_str!("store_registration.sql");
@@ -44,8 +44,11 @@ pub use mcp::{
     McpSubscriptionClaim, McpSubscriptionIntent, McpSubscriptionLimits, McpSubscriptionOperation,
     McpSubscriptionOutcome, McpSubscriptionState, McpWorkClaim, McpWorkState,
 };
+#[path = "store_partitions.rs"]
+mod partitions;
 #[path = "store_retention.rs"]
 mod retention;
+pub use partitions::{PartitionPositions, StorePartitions};
 
 #[path = "store_execution.rs"]
 mod execution;
@@ -244,20 +247,36 @@ impl Store {
         now_ms: i64,
         expires_at_ms: i64,
     ) -> Result<RunLease, StoreError> {
+        self.acquire_candidate(run, owner, now_ms, expires_at_ms, false)
+            .await
+    }
+
+    pub(crate) async fn acquire_candidate(
+        &self,
+        run: &RunId,
+        owner: String,
+        now_ms: i64,
+        expires_at_ms: i64,
+        parked_only: bool,
+    ) -> Result<RunLease, StoreError> {
         check_lease_times(now_ms, expires_at_ms)?;
         self.check_text(&owner)?;
         let limits = self.config.limits.clone();
         let run = run.clone();
-        self.connection.call(move |db| -> Result<RunLease, StoreError> {
+        self.connection.write_run(run.to_string(), move |db| -> Result<RunLease, StoreError> {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let header = load_header(&tx, &run)?;
             if header.status.is_terminal() { return Err(StoreError::Terminal); }
+            if parked_only {
+                let parked: bool = tx.query_row("SELECT owner IS NULL AND eligible_at_ms>0 FROM runs WHERE run_id=?1", [run.as_str()], |row| row.get(0))?;
+                if !parked { return Err(StoreError::Fenced); }
+            }
             let now = now_ms.max(header.last_time_ms);
             if expires_at_ms <= now { return Err(StoreError::Invalid); }
             if header.owner.is_some() && header.expires_at_ms.is_some_and(|expiry| expiry > now) { return Err(StoreError::Fenced); }
             let fence = header.fence.checked_add(1).ok_or(StoreError::Invalid)?;
             let sequence = header.sequence.checked_add(1).ok_or(StoreError::Invalid)?;
-            tx.execute("UPDATE runs SET owner=?2,fence=?3,lease_expires_ms=?4,sequence=?5,last_time_ms=?6 WHERE run_id=?1", params![run.as_str(), owner, fence, expires_at_ms, sequence, now])?;
+            tx.execute("UPDATE runs SET owner=?2,fence=?3,lease_expires_ms=?4,eligible_at_ms=?4,sequence=?5,last_time_ms=?6 WHERE run_id=?1", params![run.as_str(), owner, fence, expires_at_ms, sequence, now])?;
             let payload = lease_payload(&owner, fence, expires_at_ms, &limits)?;
             append_event(&tx, run.as_str(), sequence, EventMeta { kind: "ownership_acquired", actor: &owner, timestamp: now, causation: "ownership", command: None }, &payload, &limits)?;
             tx.commit()?;
@@ -279,7 +298,7 @@ impl Store {
         check_lease_times(now_ms, expires_at_ms)?;
         let limits = self.config.limits.clone();
         let lease = lease.clone();
-        self.connection.call(move |db| -> Result<(), StoreError> {
+        self.connection.write_run(lease.run_id().to_string(), move |db| -> Result<(), StoreError> {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let header = load_header(&tx, &lease.run_id)?;
             let now = now_ms.max(header.last_time_ms);
@@ -287,7 +306,7 @@ impl Store {
             if header.status.is_terminal() { return Err(StoreError::Terminal); }
             if expires_at_ms <= now || header.expires_at_ms.is_some_and(|old| expires_at_ms < old) { return Err(StoreError::Invalid); }
             let sequence = header.sequence.checked_add(1).ok_or(StoreError::Invalid)?;
-            tx.execute("UPDATE runs SET lease_expires_ms=?2,sequence=?3,last_time_ms=?4 WHERE run_id=?1", params![lease.run_id.as_str(), expires_at_ms, sequence, now])?;
+            tx.execute("UPDATE runs SET lease_expires_ms=?2,eligible_at_ms=?2,sequence=?3,last_time_ms=?4 WHERE run_id=?1", params![lease.run_id.as_str(), expires_at_ms, sequence, now])?;
             let payload = lease_payload(&lease.owner, lease.fence, expires_at_ms, &limits)?;
             append_event(&tx, lease.run_id.as_str(), sequence, EventMeta { kind: "ownership_renewed", actor: &lease.owner, timestamp: now, causation: "ownership", command: None }, &payload, &limits)?;
             tx.commit()?;
@@ -301,7 +320,7 @@ impl Store {
     pub async fn run_header(&self, run: &RunId) -> Result<RunHeader, StoreError> {
         let run = run.clone();
         self.connection
-            .call(move |db| load_header(db, &run))
+            .read(move |db| load_header(db, &run))
             .await
             .map_err(StoreError::from_worker)
     }
