@@ -2,6 +2,7 @@
 use crate::{
     SourceLocation, SourceSpan,
     ast::*,
+    catalogs::CatalogKind,
     diagnostic::{Result, fail},
     executable::{
         BinaryOperator as Op, PathStep, ScalarLiteral,
@@ -529,14 +530,17 @@ impl Parser {
                                     self.expect("mcp")?;
                                     self.expect(".")?;
                                     let category = self.word()?;
-                                    if !matches!(
-                                        (op.as_str(), category.as_str()),
-                                        ("call", "tool")
-                                            | ("read", "resource" | "template")
-                                            | ("fetch", "prompt")
-                                    ) {
-                                        return Err(self.error("invalid MCP operation selector"));
-                                    }
+                                    let category = match (op.as_str(), category.as_str()) {
+                                        ("call", "tool") => CatalogKind::Tool,
+                                        ("read", "resource") => CatalogKind::Resource,
+                                        ("read", "template") => CatalogKind::Template,
+                                        ("fetch", "prompt") => CatalogKind::Prompt,
+                                        _ => {
+                                            return Err(
+                                                self.error("invalid MCP operation selector")
+                                            );
+                                        }
+                                    };
                                     self.expect("(")?;
                                     let server = self.string()?;
                                     self.expect(",")?;

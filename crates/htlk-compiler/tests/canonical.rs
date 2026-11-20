@@ -616,7 +616,7 @@ fn all_mcp_categories_waits_and_retry_options_lower_to_exact_interfaces() {
         r#"[{"server":"service","descriptor":{"name":"tool","inputSchema":{"type":"object"},"outputSchema":{"type":"object"}}}]"#,
         r#"[{"server":"service","descriptor":{"name":"notes","uri":"file:///notes"}}]"#,
         r#"[{"server":"service","descriptor":{"name":"document","uriTemplate":"file:///docs/{customerId}"}}]"#,
-        r#"[{"server":"service","descriptor":{"name":"prompt","arguments":[{"name":"Content-Type","required":false}]}}]"#,
+        r#"[{"server":"service","descriptor":{"name":"tool","arguments":[{"name":"Content-Type","required":false}]}}]"#,
         "{}",
     );
     let source = r#"ir_version="0.1"
@@ -628,7 +628,7 @@ fn all_mcp_categories_waits_and_retry_options_lower_to_exact_interfaces() {
           tool=call(mcp.tool("service","tool")){retry{max_attempts=2 on=["Z","A","A"] backoff_ms=[0]} limits{attempt_timeout_ms=100 max_mcp_calls=2}}
           resource=read(mcp.resource("service","file:///notes"))
           template=read(mcp.template("service","file:///docs/{customerId}"))
-          prompt=fetch(mcp.prompt("service","prompt"))
+          prompt=fetch(mcp.prompt("service","tool"))
           approval=wait(string){topic="review" timeout_ms=1000}
         }
         edges{
@@ -645,6 +645,10 @@ fn all_mcp_categories_waits_and_retry_options_lower_to_exact_interfaces() {
       }"#;
     let output = compiler.compile_source(source, &catalogs).unwrap();
     assert_eq!(output.canonical_document.fields().bindings.len(), 4);
+    let admitted = compiler
+        .compile_document(output.canonical_document().clone(), &catalogs)
+        .unwrap();
+    assert_eq!(admitted.executable_bytes(), output.executable_bytes());
     let root =
         &output.canonical_document.fields().scopes[&output.canonical_document.fields().root_scope];
     let node = root
@@ -676,6 +680,55 @@ fn all_mcp_categories_waits_and_retry_options_lower_to_exact_interfaces() {
     };
     assert_eq!(fields[0].0, "customerId");
     assert!(fields[0].1.required());
+}
+
+#[test]
+fn identical_tool_names_select_by_compound_server_identity() {
+    let (compiler, _) = compiler();
+    let first =
+        r#"{"name":"lookup","description":"First deployment","inputSchema":{"type":"object"}}"#;
+    let second = first.replace("First", "Second");
+    let inventory = |reverse| {
+        let (a, b) = if reverse {
+            (&*second, first)
+        } else {
+            (first, &*second)
+        };
+        let json = format!(
+            r#"{{
+          "tools":{{"catalog_version":"0.1","mcp_protocol_version":"2025-11-25","schema_documents":{{}},
+            "servers":{{"a":{{"deployment_id":"alpha","transport":"stdio","implementation_name":"fixture","implementation_version":"1"}},
+                        "b":{{"deployment_id":"beta","transport":"stdio","implementation_name":"fixture","implementation_version":"1"}}}},
+            "tools":[{{"server":"a","descriptor":{a}}},{{"server":"b","descriptor":{b}}}]}},
+          "resources":{{"catalog_version":"0.1","mcp_protocol_version":"2025-11-25","servers":{{}},"schema_documents":{{}},"resources":[],"templates":[]}},
+          "prompts":{{"catalog_version":"0.1","mcp_protocol_version":"2025-11-25","servers":{{}},"schema_documents":{{}},"prompts":[]}}
+        }}"#
+        );
+        MCPCatalogInputs::from_json(json.as_bytes(), &Limits::default()).unwrap()
+    };
+    let source = r#"ir_version="0.1" graph test.lookup {
+      inputs={} outputs={value=McpToolResult}
+      nodes{args=eval(json,{}) lookup=call(mcp.tool("b","lookup"))}
+      edges{edge args{from=args.outputs.value to=lookup.inputs.arguments}
+            edge result{from=lookup.outputs.value to=outputs.value}}
+    }"#;
+    let output = compiler.compile_source(source, &inventory(false)).unwrap();
+    let binding = output
+        .canonical_document
+        .fields()
+        .bindings
+        .values()
+        .next()
+        .unwrap();
+    let descriptor = JsonDocument::new(second.as_bytes(), &Limits::default()).unwrap();
+    assert_eq!(binding.descriptor(), descriptor.digest());
+    assert_eq!(
+        compiler
+            .compile_document(output.canonical_document().clone(), &inventory(true))
+            .unwrap_err()
+            .to_string(),
+        "C_MCP: selected descriptor does not match supplied catalogs"
+    );
 }
 
 #[test]
