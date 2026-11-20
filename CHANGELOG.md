@@ -13,6 +13,9 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ### Changed
 
+- The SQLite layout uses indexed artifact-expiry and running-run lookups (schema
+  15). Both backends read the first scheduling page with the header and advisory
+  clock in one storage operation. Native implementation identities change.
 - Historical runtime inspection uses committed version projections on both backends:
   SQLite schema 14 and PostgreSQL layout 2 reject older stores without migration or
   deletion. Native implementation identities and executable fingerprints change.

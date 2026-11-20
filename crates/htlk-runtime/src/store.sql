@@ -12,6 +12,7 @@ CREATE TABLE runs (
     CHECK((owner IS NULL AND lease_expires_ms IS NULL) OR
           (owner IS NOT NULL AND lease_expires_ms IS NOT NULL))
 ) STRICT;
+CREATE INDEX running_run_ids ON runs(run_id) WHERE status='running';
 CREATE TABLE journal (
     run_id TEXT NOT NULL REFERENCES runs(run_id),
     sequence INTEGER NOT NULL CHECK(sequence >= 1),
@@ -43,6 +44,7 @@ CREATE TABLE records (
     payload BLOB NOT NULL,
     PRIMARY KEY(run_id,family,record_id)
 ) STRICT;
+CREATE INDEX artifact_tombstones_by_id ON records(record_id) WHERE family='tombstone';
 CREATE TABLE commands (
     run_id TEXT NOT NULL,
     command_id TEXT NOT NULL,

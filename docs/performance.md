@@ -209,6 +209,11 @@ records from the benchmark. For a missing tombstone, the median lookup was
 `record_id WHERE family='tombstone'`. This validates the query-plan change in
 isolation; it is not an end-to-end speedup estimate for HTLK's bundled SQLite.
 
+With the SQLite indexes and the shared first-page scheduling probe, a repeat of
+the 4,096-run case on the same host achieved **229.3 runs/s** (87.9 ms p95).
+The four completion groups sustained 238.6, 210.5, 230.7 and 239.9 runs/s. This
+single follow-up compares the combined changes, not the isolated index cost.
+
 ### Bottleneck priorities
 
 1. **Reduce PostgreSQL round trips per unit of durable work.** Each store operation

@@ -1,6 +1,50 @@
 //! Bounded recovery/scheduling scans derived from authoritative records.
 use super::*;
+
+pub(crate) struct SchedulingPage {
+    pub header: RunHeader,
+    pub now: i64,
+    pub scopes: Vec<StoredRecord>,
+}
+
 impl SqliteStore {
+    /// Observe the header, logical time and first scope page together without
+    /// advancing the store clock. Acceptance still samples the authoritative clock.
+    pub(crate) async fn scheduling_page(
+        &self,
+        run: &RunId,
+        observed: i64,
+    ) -> Result<SchedulingPage, StoreError> {
+        let run = run.clone();
+        let config = self.config.clone();
+        self.connection
+            .call(move |db| {
+                let tx = db.transaction_with_behavior(TransactionBehavior::Deferred)?;
+                let header = load_header(&tx, &run)?;
+                let (now, scopes) = if header.status.is_terminal() {
+                    (header.last_time_ms, Vec::new())
+                } else {
+                    let now = runs::observed_time(&tx, observed)?;
+                    let scopes = record_page(
+                        &tx,
+                        &run,
+                        RecordFamily::Scope,
+                        None,
+                        config.max_page_size,
+                        &config.limits,
+                    )?;
+                    (now, scopes)
+                };
+                tx.commit()?;
+                Ok(SchedulingPage {
+                    header,
+                    now,
+                    scopes,
+                })
+            })
+            .await
+            .map_err(StoreError::from_worker)
+    }
     pub(crate) async fn record_protection(
         &self,
         run: &RunId,
@@ -169,8 +213,10 @@ impl SqliteStore {
         let after = after.map(ToString::to_string);
         let limits = self.config.limits.clone();
         self.connection.call(move|db|->Result<Vec<RunId>,StoreError>{
-            let mut statement=db.prepare("SELECT run_id FROM runs WHERE status='running' AND (?1 IS NULL OR run_id>?1) ORDER BY run_id LIMIT ?2")?;
-            let mut rows=statement.query(params![after,page_size as i64])?;let mut result=Vec::new();let mut bytes=0usize;
+            let first = "SELECT run_id FROM runs WHERE status='running' ORDER BY run_id LIMIT ?1";
+            let next = "SELECT run_id FROM runs WHERE status='running' AND run_id>?1 ORDER BY run_id LIMIT ?2";
+            let mut statement=db.prepare(if after.is_some() { next } else { first })?;
+            let mut rows=match after { Some(after) => statement.query(params![after,page_size as i64])?, None => statement.query([page_size as i64])? };let mut result=Vec::new();let mut bytes=0usize;
             while let Some(row)=rows.next()?{let id=row.get_ref(0)?.as_str().map_err(|_|StoreError::Corrupt)?;bytes=bytes.checked_add(id.len()+1).ok_or(StoreError::Invalid)?;if bytes>limits.max_document_bytes{return Err(StoreError::Invalid)}result.push(RunId::new(id.into(),&limits).map_err(|_|StoreError::Corrupt)?);}
             Ok(result)
         }).await.map_err(StoreError::from_worker)
@@ -194,16 +240,92 @@ impl SqliteStore {
             after.map(str::to_owned),
             self.config.limits.clone(),
         );
-        self.connection.call(move|db|->Result<Vec<StoredRecord>,StoreError>{
-            let mut statement=db.prepare("SELECT record_id,revision,final,payload FROM records WHERE run_id=?1 AND family=?2 AND (?3 IS NULL OR record_id>?3) ORDER BY record_id LIMIT ?4")?;
-            let mut rows=statement.query(params![run.as_str(),family.as_str(),after,page_size as i64])?;let mut result=Vec::new();let mut bytes=0usize;
-            while let Some(row)=rows.next()?{
-                let id=row.get_ref(0)?.as_str().map_err(|_|StoreError::Corrupt)?;let raw=row.get_ref(3)?.as_blob().map_err(|_|StoreError::Corrupt)?;
-                let size=raw.len().checked_add(id.len()).ok_or(StoreError::Invalid)?;
-                if bytes.checked_add(size).is_none_or(|n|n>limits.max_document_bytes){if result.is_empty(){return Err(StoreError::Invalid)}break}
-                bytes+=size;let payload=cbor::decode(raw,&limits).map_err(|_|StoreError::Corrupt)?;
-                result.push(StoredRecord{key:RecordKey{family,id:id.into()},revision:row.get(1)?,final_record:row.get(2)?,payload});
-            }Ok(result)
-        }).await.map_err(StoreError::from_worker)
+        self.connection
+            .call(move |db| record_page(db, &run, family, after.as_deref(), page_size, &limits))
+            .await
+            .map_err(StoreError::from_worker)
+    }
+}
+
+fn record_page(
+    db: &rusqlite::Connection,
+    run: &RunId,
+    family: RecordFamily,
+    after: Option<&str>,
+    page_size: usize,
+    limits: &Limits,
+) -> Result<Vec<StoredRecord>, StoreError> {
+    let mut statement = db.prepare("SELECT record_id,revision,final,payload FROM records WHERE run_id=?1 AND family=?2 AND (?3 IS NULL OR record_id>?3) ORDER BY record_id LIMIT ?4")?;
+    let mut rows = statement.query(params![
+        run.as_str(),
+        family.as_str(),
+        after,
+        page_size as i64
+    ])?;
+    let mut result = Vec::new();
+    let mut bytes = 0usize;
+    while let Some(row) = rows.next()? {
+        let id = row.get_ref(0)?.as_str().map_err(|_| StoreError::Corrupt)?;
+        let raw = row.get_ref(3)?.as_blob().map_err(|_| StoreError::Corrupt)?;
+        let size = raw.len().checked_add(id.len()).ok_or(StoreError::Invalid)?;
+        if bytes
+            .checked_add(size)
+            .is_none_or(|n| n > limits.max_document_bytes)
+        {
+            if result.is_empty() {
+                return Err(StoreError::Invalid);
+            }
+            break;
+        }
+        bytes += size;
+        let payload = cbor::decode(raw, limits).map_err(|_| StoreError::Corrupt)?;
+        result.push(StoredRecord {
+            key: RecordKey {
+                family,
+                id: id.into(),
+            },
+            revision: row.get(1)?,
+            final_record: row.get(2)?,
+            payload,
+        });
+    }
+    Ok(result)
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod tests {
+    use super::*;
+
+    #[actix::test]
+    async fn scheduling_observation_does_not_publish_a_clock_write() {
+        let store = Store::in_memory(StoreConfig::default()).await.unwrap();
+        let run = RunId::new("schedule".into(), &Limits::default()).unwrap();
+        let root = ScopeInstanceId::root(&run, &Limits::default())
+            .unwrap()
+            .to_string();
+        store.connection.call::<_, StoreError>(move |db| {
+            db.execute("INSERT INTO runs(run_id,fingerprint,root_scope,status,sequence,fence,last_time_ms) VALUES('schedule',?1,?2,'running',1,0,10)", params![Digest::from_bytes([1; 32]).to_string(), root])?;
+            Ok(())
+        }).await.unwrap();
+        let first = store.scheduling_page(&run, 100).await.unwrap();
+        assert_eq!(first.now, 100);
+        assert_eq!(first.header.sequence, 1);
+        let second = store.scheduling_page(&run, 5).await.unwrap();
+        assert_eq!(second.now, 10);
+    }
+
+    #[actix::test]
+    async fn expiry_and_runnable_lookups_use_bounded_indexes() {
+        let store = Store::in_memory(StoreConfig::default()).await.unwrap();
+        store.connection.call::<_, StoreError>(|db| {
+            for (sql, index) in [
+                ("EXPLAIN QUERY PLAN SELECT final,payload FROM records WHERE family='tombstone' AND record_id=?1", "artifact_tombstones_by_id"),
+                ("EXPLAIN QUERY PLAN SELECT run_id FROM runs WHERE status='running' AND run_id>?1 ORDER BY run_id LIMIT 64", "running_run_ids"),
+            ] {
+                let plan: String = db.query_row(sql, ["sentinel"], |row| row.get(3))?;
+                assert!(plan.contains("SEARCH") && plan.contains(index), "{plan}");
+            }
+            Ok(())
+        }).await.unwrap();
     }
 }

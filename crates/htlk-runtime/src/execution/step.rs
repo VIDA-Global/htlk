@@ -60,18 +60,19 @@ async fn tick_observed(
     lease: RunLease,
     #[cfg(all(test, feature = "sqlite"))] probe: Option<&tests::Probe>,
 ) -> Result<Progress, RuntimeError> {
-    let header = runtime.store.run_header(lease.run_id()).await?;
+    let page = runtime
+        .store
+        .scheduling_page(lease.run_id(), runtime.clock.now_ms()?)
+        .await?;
+    let header = page.header;
     if header.status.is_terminal() {
         return Ok(Progress::Terminal);
     }
-    let now = runtime
-        .store
-        .coordinator_time(runtime.clock.now_ms()?)
-        .await?;
-    let mut cursor = None;
-    let mut scopes = Vec::new();
+    let now = page.now;
+    let mut scopes = page.scopes;
+    let mut cursor = scopes.last().map(|r| r.key.id.clone());
     let mut wake_at = i64::MAX;
-    loop {
+    while cursor.is_some() {
         let page = runtime
             .store
             .records(
