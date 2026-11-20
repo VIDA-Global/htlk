@@ -98,6 +98,7 @@ pub fn native_profile(
         include_bytes!("mcp/native_sessions.rs"),
         include_bytes!("mcp_control.rs"),
         include_bytes!("execution/mcp.rs"),
+        include_bytes!("execution/mcp_recovery.rs"),
         include_bytes!("execution/approval.rs"),
         include_bytes!("execution/extension.rs"),
         include_bytes!("store_late.sql"),

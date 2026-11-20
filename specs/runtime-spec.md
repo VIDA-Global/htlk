@@ -330,6 +330,17 @@ MCP has no universal idempotency-key behavior for arbitrary tools. Trusted adapt
 
 Response persistence precedes result acceptance. A crash after `response_recorded` retries local validation/commit without recalling MCP. Output schema failures may allow another safe dispatch only under an explicit retry code and replay policy. Input/precondition, descriptor, capability, and deterministic pure failures are not repaired by repeating the same call.
 
+A trusted host that durably saved a correlated response before native response
+persistence may submit that exact response under a current successor fence. The
+runtime MUST check current recovery authorization and the original store, run,
+invocation, attempt, binding and request. First submission requires a still-active
+attempt and ancestry, an outstanding reservation and unelapsed original deadlines.
+The response checkpoint and its replay receipt commit atomically. This path uses
+normal response validation and evidence, but cannot resend the operation, replace
+the attempt or replenish accounting. An exact retry under current authority returns
+the original receipt. Conflicts and first late submissions leave execution and
+terminal outcomes unchanged; the host retains its original late evidence.
+
 Retries never change inputs. Changed prompts or arguments require another node or loop iteration. Compensating operations are explicit graph nodes and may themselves fail.
 
 ## 8. Atomic output acceptance and artifacts
@@ -691,7 +702,8 @@ start_run(
     fingerprint,
     inputs: map(InputValue),
     idempotency_key,
-    limits?
+    limits?,
+    not_after_ms?
 ) -> { run_id }
 
 submit_reply(
@@ -731,6 +743,14 @@ read_artifact(artifact_id) -> AuthorizedValue
 The caller principal comes from authenticated request context. Idempotency keys are required for mutating host operations. They are scoped by principal, method, and target; the stored request digest includes all semantic arguments. Same key with a different request yields `E_IDEMPOTENCY_CONFLICT`. Retention bounds are advertised by the host.
 
 `start_run` rejects invalid input or unsupported budget enforcement before creating work. A valid run whose root precondition fails is created and terminates failed with that evidence. `extend_run` accepts only declared composed-root input names. Missing required inputs fail except for the explicit preserved-input mapping in section 12; optional omission remains absence unless that mapping preserves an existing entry. No other old-value inference occurs.
+
+An optional `not_after_ms` is a frozen, exclusive coordinator epoch-millisecond
+bound and part of the original start request digest. Under the admission write
+authority, current coordinator time at or after the bound prohibits fresh
+admission. The run and root timers also cannot exceed this bound or any stricter
+applicable limit. A retained matching receipt wins over the execution deadline.
+Reconciliation of an uncertain start only reads evidence for the original
+request; missing or expired evidence is not proof that the admission rolled back.
 
 RunView exposes active fingerprint, root scope ID, terminal/blocked status and reasons, inputs, outputs, open waits, usage, and extension history. NodeView exposes definition/operation identity, status, guard result, each candidate binding, admitted input hash, attempts, wait, loop iteration, output artifacts, and causes. GraphView exposes scope hierarchy, ports, data and guard dependencies, types, descriptors, library identities, and completion checks.
 

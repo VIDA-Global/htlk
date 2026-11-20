@@ -278,6 +278,19 @@ pub trait RuntimePolicy: Send + Sync {
         context: &HostContext,
         action: Authorization<'_>,
     ) -> Result<(), RuntimeFailure>;
+    /// Authorizes a trusted host to submit its durably saved original graph MCP
+    /// response. Inspection, attachment and dispatch authorization do not grant
+    /// this permission. The default denies recovery.
+    ///
+    /// # Errors
+    /// Returns a redacted current-policy failure.
+    fn authorize_graph_mcp_recovery(
+        &self,
+        _context: &HostContext,
+        _recovery: crate::mcp::McpGraphRecovery<'_>,
+    ) -> Result<(), RuntimeFailure> {
+        Err(RuntimeFailure::new(FailureCode::Policy))
+    }
     /// Assigns trusted ingress/boundary labels when run inputs are admitted. None
     /// represents actual absence, not null. Values cannot assign their own
     /// protection through fields such as `security_labels`.

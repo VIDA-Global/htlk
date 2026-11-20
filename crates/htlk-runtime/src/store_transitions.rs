@@ -165,7 +165,71 @@ pub struct OutboxNotice {
     pub sequence: i64,
 }
 
+pub(crate) struct GraphResponseCommit {
+    pub namespace: String,
+    pub attempt: crate::identity::AttemptId,
+    pub response_digest: Digest,
+    pub sequence: i64,
+    pub first: Option<(i64, Transition)>,
+}
+
 impl SqliteStore {
+    pub(crate) async fn commit_graph_response(
+        &self,
+        lease: &RunLease,
+        request: GraphResponseCommit,
+        clock: std::sync::Arc<dyn crate::clock::CoordinatorClock>,
+    ) -> Result<CommitReceipt, StoreError> {
+        let limits = self.config.limits.clone();
+        let lease = lease.clone();
+        let first = request
+            .first
+            .map(|(deadline, transition)| {
+                Ok::<_, StoreError>((
+                    deadline,
+                    PreparedTransition::new(&lease, transition, &limits)?,
+                ))
+            })
+            .transpose()?;
+        self.connection.write_run(lease.run_id().to_string(), move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let namespace: String = tx.query_row("SELECT namespace FROM runtime_identity WHERE singleton=1", [], |row| row.get(0))?;
+            if namespace != request.namespace { return Err(StoreError::Invalid); }
+            let header = load_header(&tx, lease.run_id())?;
+            let now = runs::observed_time(&tx, clock.now_ms().map_err(|_| StoreError::Invalid)?)?;
+            check_authority(&header, &lease, now)?;
+            // Covers the exact checkpoints used by preparation and policy, including
+            // response labels, active ancestry and the outstanding reservation.
+            if header.sequence != request.sequence { return Err(StoreError::Conflict); }
+            let existing = tx.query_row(
+                "SELECT payload,final FROM records WHERE run_id=?1 AND family='response' AND record_id=?2",
+                params![lease.run_id().as_str(), request.attempt.to_string()],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, bool>(1)?)),
+            ).optional()?;
+            if let Some((bytes, final_record)) = existing {
+                let Value::Map(response) = decode_stored(&bytes, &limits)? else { return Err(StoreError::Corrupt); };
+                if !final_record { return Err(StoreError::Corrupt); }
+                if response.get("host_recovery_digest") != Some(&Value::Text(request.response_digest.to_string())) {
+                    return Err(StoreError::IdempotencyConflict);
+                }
+                let sequence = tx.query_row(
+                    "SELECT sequence FROM commands WHERE run_id=?1 AND command_id=?2",
+                    params![lease.run_id().as_str(), format!("recover-response:{}", request.attempt)],
+                    |row| row.get(0),
+                )?;
+                tx.commit()?;
+                return Ok(CommitReceipt { sequence });
+            }
+            if header.status.is_terminal() { return Err(StoreError::Terminal); }
+            let (deadline, mut prepared) = first.ok_or(StoreError::Conflict)?;
+            if now >= deadline { return Err(StoreError::Deadline(FailureCode::Timeout)); }
+            prepared.transition.context.timestamp_ms = now;
+            let receipt = prepared.apply_at_sequence(&tx, &lease, &limits, Some(request.sequence), false)?;
+            tx.commit()?;
+            Ok(receipt)
+        }).await.map_err(StoreError::from_worker)
+    }
+
     pub(crate) async fn commit_pure_batch(
         &self,
         lease: &RunLease,

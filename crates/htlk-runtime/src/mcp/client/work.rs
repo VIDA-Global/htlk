@@ -128,6 +128,7 @@ impl McpHostWorkReceipt {
                 server: self.server,
                 deadline_ms: self.deadline_ms,
                 labels: self.labels.clone(),
+                graph_attempt: None,
             });
         session
             .invoke_parent(request, context, None, Some(Arc::new(self.clone())))

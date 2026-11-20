@@ -70,6 +70,7 @@ mod replay;
 #[path = "store_transitions.rs"]
 mod transitions;
 pub use replay::{ReplayState, ReplayedStartReceipt};
+pub(crate) use transitions::GraphResponseCommit;
 pub use transitions::{
     CommitReceipt, JournalEntry, JournalEvent, OutboxNotice, RecordFamily, RecordKey, RecordWrite,
     RootReplacement, StoredRecord, Transition, TransitionContext,
