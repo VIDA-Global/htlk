@@ -8,4 +8,5 @@ Each checked item has its verification results in the linked record.
 2. [x] [Consolidate compiler diagnostic location mapping](01-compiler-diagnostic-locations.md)
 3. [x] [Cover stdio discovery classifications](02-stdio-discovery-classification.md)
 4. [x] [Run SQLite-only tests in CI](03-sqlite-only-ci.md)
-5. [ ] [Verify the completed cleanup](04-final-verification.md)
+5. [x] [Isolate example test logs](04-example-log-isolation.md)
+6. [ ] [Verify the completed cleanup](05-final-verification.md)

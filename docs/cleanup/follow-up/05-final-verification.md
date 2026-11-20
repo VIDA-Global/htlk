@@ -1,4 +1,4 @@
-# 04: Verify the completed cleanup
+# 05: Verify the completed cleanup
 
 **Scope and acceptance.** Run the workspace verification suite and review the
 committed diff for changes to public APIs, behavior, dependencies, or native
