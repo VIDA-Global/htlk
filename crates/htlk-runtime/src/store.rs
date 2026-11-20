@@ -506,6 +506,21 @@ fn append_event(
     payload: &[u8],
     limits: &Limits,
 ) -> Result<(), StoreError> {
+    append_journal(tx, run, sequence, event, payload, limits)?;
+    tx.execute(
+        "INSERT INTO outbox(run_id,sequence) VALUES(?1,?2)",
+        params![run, sequence],
+    )?;
+    Ok(())
+}
+fn append_journal(
+    tx: &rusqlite::Transaction<'_>,
+    run: &str,
+    sequence: i64,
+    event: EventMeta<'_>,
+    payload: &[u8],
+    limits: &Limits,
+) -> Result<(), StoreError> {
     // Journal rows are private records. Bound the complete logical row before it
     // becomes authoritative, including the opaque already-bounded payload bytes.
     let representation = event_value(run, sequence, &event, payload);
@@ -513,10 +528,6 @@ fn append_event(
         .value(&representation, 0)
         .map_err(|_| StoreError::Invalid)?;
     tx.execute("INSERT INTO journal(run_id,sequence,event_type,record_version,actor,timestamp_ms,causation,command_id,payload) VALUES(?1,?2,?3,'0.1',?4,?5,?6,?7,?8)", params![run,sequence,event.kind,event.actor,event.timestamp,event.causation,event.command,payload])?;
-    tx.execute(
-        "INSERT INTO outbox(run_id,sequence) VALUES(?1,?2)",
-        params![run, sequence],
-    )?;
     inspection::project(tx, run, event.kind, payload, limits)?;
     Ok(())
 }

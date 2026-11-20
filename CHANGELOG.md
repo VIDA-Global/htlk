@@ -18,6 +18,8 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ### Changed
 
+- Pure decision batches update the run sequence once and insert command receipts
+  and outbox notices together while retaining one receipt and notice per decision.
 - Inspection publication reuses existing run and record ordinals without
   attempting another insertion, and publishes only the final record version per
   physical commit.

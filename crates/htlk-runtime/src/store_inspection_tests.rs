@@ -302,6 +302,7 @@ async fn batch_abort_contract(store: &Store) {
     let seq = before.header().sequence;
     let first = || transition("first", vec![write("candidate", None, 1)], 11);
     let second = |expected| transition("second", vec![write("candidate", Some(expected), 2)], 11);
+    let pending = store.pending_outbox(100).await.unwrap();
     let key = write("candidate", None, 1).key;
     assert_eq!(
         store
@@ -332,6 +333,13 @@ async fn batch_abort_contract(store: &Store) {
     assert_eq!(
         store.record(&run.run_id, &key).await,
         Err(StoreError::Missing)
+    );
+    assert_eq!(store.pending_outbox(100).await.unwrap(), pending);
+    assert_eq!(
+        store
+            .commit_pure_batch(&lease, seq, 11, 50, vec![first(), first()], vec![])
+            .await,
+        Err(StoreError::Conflict)
     );
     assert_eq!(
         store
@@ -374,6 +382,110 @@ async fn batch_abort_contract(store: &Store) {
     );
     let counts = store.connection.read(move |db| db.query_row("SELECT (SELECT count(*) FROM inspection_record_keys WHERE run_id=?1),(SELECT count(*) FROM inspection_records v JOIN inspection_record_keys k USING(record_number) WHERE k.run_id=?1)", [run.run_id.as_str()], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))).await.unwrap();
     assert_eq!(counts, (1, 1));
+    assert_eq!(
+        store.commit(&lease, first()).await.unwrap().sequence,
+        seq + 1
+    );
+    assert_eq!(
+        store.commit(&lease, second(1)).await.unwrap().sequence,
+        seq + 2
+    );
+    assert_eq!(
+        store.commit(&lease, second(2)).await,
+        Err(StoreError::IdempotencyConflict)
+    );
+    let notices: Vec<_> = store
+        .pending_outbox(100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|notice| notice.sequence > seq && notice.run_id == *lease.run_id())
+        .collect();
+    assert_eq!(
+        notices
+            .iter()
+            .map(|notice| notice.sequence)
+            .collect::<Vec<_>>(),
+        [seq + 1, seq + 2]
+    );
+    store.acknowledge(&notices[1]).await.unwrap();
+    store.acknowledge(&notices[1]).await.unwrap();
+    assert!(
+        store
+            .pending_outbox(100)
+            .await
+            .unwrap()
+            .contains(&notices[0])
+    );
+    assert!(
+        !store
+            .pending_outbox(100)
+            .await
+            .unwrap()
+            .contains(&notices[1])
+    );
+    assert_eq!(
+        store.inspection_position().await.unwrap(),
+        *after.position()
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[actix::test]
+async fn batch_writes_one_run_header_and_rolls_back_on_outbox_failure() {
+    let store = Store::in_memory(StoreConfig::default()).await.unwrap();
+    let run = seed("batch-writes");
+    store.create_run(run.clone()).await.unwrap();
+    let lease = store
+        .acquire(&run.run_id, "owner".into(), 10, 100)
+        .await
+        .unwrap();
+    let before = store.run_header(&run.run_id).await.unwrap();
+    let batch = || {
+        vec![
+            transition("first", vec![write("key", None, 1)], 11),
+            transition("second", vec![write("key", Some(1), 2)], 11),
+        ]
+    };
+    store.connection.call(|db| db.execute_batch("CREATE TABLE header_writes (sequence INTEGER); CREATE TRIGGER count_run_updates AFTER UPDATE ON runs BEGIN INSERT INTO header_writes VALUES(new.sequence); END; CREATE TRIGGER reject_second_notice BEFORE INSERT ON outbox WHEN new.sequence=4 BEGIN SELECT RAISE(ABORT,'reject outbox'); END;")).await.unwrap();
+    assert_eq!(
+        store
+            .commit_pure_batch(&lease, before.sequence, 11, 50, batch(), vec![])
+            .await,
+        Err(StoreError::Database)
+    );
+    assert_eq!(store.run_header(&run.run_id).await.unwrap(), before);
+    assert!(
+        store
+            .journal(&run.run_id, before.sequence, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .connection
+        .call(|db| db.execute_batch("DROP TRIGGER reject_second_notice"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .commit_pure_batch(&lease, before.sequence, 11, 50, batch(), vec![])
+            .await
+            .unwrap(),
+        before.sequence + 2
+    );
+    let updates = store
+        .connection
+        .read(|db| {
+            db.query_row(
+                "SELECT count(*),max(sequence) FROM header_writes",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(updates, (1, before.sequence + 2));
 }
 
 #[cfg(feature = "sqlite")]
