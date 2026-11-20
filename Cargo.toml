@@ -103,6 +103,11 @@ required-features = ["sqlite"]
 name = "runtime_workflow"
 required-features = ["sqlite"]
 
+[[example]]
+name = "performance"
+path = "examples/performance/main.rs"
+required-features = ["sqlite", "postgres"]
+
 [lints]
 workspace = true
 

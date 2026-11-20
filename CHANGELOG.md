@@ -6,6 +6,11 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ## [Unreleased]
 
+### Added
+
+- Repeatable release-mode performance campaigns for durable SQLite and PostgreSQL,
+  with raw timing samples and correctness checks under load.
+
 ### Changed
 
 - Historical runtime inspection uses committed version projections on both backends:
