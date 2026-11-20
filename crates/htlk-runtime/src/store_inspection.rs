@@ -672,7 +672,7 @@ pub(crate) fn flush_projection(db: &rusqlite::Connection) -> rusqlite::Result<()
     }
     let position = {
         // Serialize publication until physical commit, after independent work
-        // has already run under its own run row lock.
+        // has already run under its own run lock.
         let sql = "SELECT position FROM inspection_clock WHERE singleton=1";
         #[cfg(feature = "postgres")]
         let sql = if db.is_postgres() {

@@ -297,9 +297,13 @@ impl Database {
             OperationMode::Read => self.batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"),
             OperationMode::Exclusive => self.batch("BEGIN ISOLATION LEVEL READ COMMITTED; SELECT pg_advisory_xact_lock(hashtextextended(current_database() || ':' || current_schema(), 1213484107))"),
             OperationMode::Run(run) => self.batch("BEGIN ISOLATION LEVEL READ COMMITTED; SELECT pg_advisory_xact_lock_shared(hashtextextended(current_database() || ':' || current_schema(), 1213484107))").and_then(|()| {
-                // Gate before row lock; all narrowly gated writers take this
-                // lock before inspecting authority, revision or journal state.
-                self.query_one("SELECT sequence FROM runs WHERE run_id=?1 FOR UPDATE", vec![Value::Text(run)]).map(|_| ())
+                 // The two-int advisory lock space is distinct from the bigint
+                 // schema gate. Hash collisions only serialize unrelated runs.
+                 // A receipt-only retry must not generate WAL by locking a row.
+                 self.query_one(
+                     "SELECT 1::bigint FROM pg_advisory_xact_lock(hashtext(current_database() || ':' || current_schema()), hashtext(encode(?1::bytea,'hex')))",
+                     vec![Value::Blob(run.into_bytes())],
+                 ).map(|_| ())
             }),
         };
         if let Err(error) = result {

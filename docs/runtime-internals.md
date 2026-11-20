@@ -115,7 +115,8 @@ opening also compare the exact embedded layout digest; a matching version label
 cannot reinterpret a different private layout. Initialization and
 multi-domain operations use an exclusive database/schema-scoped transaction
 advisory lock. Ordinary commits, acquisition, renewal, and parking take the shared
-form of that gate and then lock only the target run row. Exclusive operations
+form of that gate and then take a per-run advisory lock. Receipt-only retries
+do not lock a database row or generate WAL. Exclusive operations
 coordinate retention, callback accounting, initialization, and ID-block reservation
 against those run writers. Time probes are read-only and account for committed run
 timestamps. Journaled writers lock the inspection clock

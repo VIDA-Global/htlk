@@ -16,6 +16,8 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ### Changed
 
+- PostgreSQL per-run advisory locks keep receipt-only retries from generating WAL
+  or waiting for a new synchronous replication acknowledgment.
 - Current and historical records share immutable checkpoint payloads, and
   historical projections publish once per physical commit. This changes native
   identities and requires SQLite layout 17 or PostgreSQL layout 4.
