@@ -117,7 +117,7 @@ impl SqliteStore {
                 if write.expected_revision.is_some(){return Err(StoreError::Invalid)}
                 artifacts::check_artifact_write(&tx,&prepared.run_id,write,&limits)?;
                 let payload=cbor::encode(&write.payload,&limits)?;
-                tx.execute("INSERT INTO records(run_id,family,record_id,revision,final,payload) VALUES(?1,?2,?3,1,?4,?5)",params![prepared.run_id.as_str(),write.key.family.as_str(),write.key.id,write.final_record,payload])?;
+                transitions::write_checkpoint(&tx, &prepared.run_id, write, 1, &payload)?;
             }
             // Existing artifact aliases must still be accepted and present when
             // the new active manifest becomes a retention root.

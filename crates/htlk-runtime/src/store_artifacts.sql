@@ -4,7 +4,7 @@ CREATE TABLE value_blobs (
     value_bytes BLOB NOT NULL
 ) STRICT;
 CREATE UNIQUE INDEX accepted_artifact_identity
-    ON records(record_id) WHERE family='artifact';
+    ON record_heads(record_id) WHERE family='artifact';
 -- Rebuildable uniqueness index over authoritative artifact producer metadata.
 CREATE TABLE artifact_producers (
     producer_kind TEXT NOT NULL CHECK(producer_kind IN ('run_input','node_output')),
@@ -15,6 +15,6 @@ CREATE TABLE artifact_producers (
     run_id TEXT NOT NULL,
     family TEXT NOT NULL DEFAULT 'artifact' CHECK(family='artifact'),
     PRIMARY KEY(producer_kind,producer_id,extension_number,port),
-    FOREIGN KEY(run_id,family,artifact_id) REFERENCES records(run_id,family,record_id)
+    FOREIGN KEY(run_id,family,artifact_id) REFERENCES record_heads(run_id,family,record_id)
         DEFERRABLE INITIALLY DEFERRED
 ) STRICT;

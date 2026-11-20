@@ -16,7 +16,7 @@ use htlk_executable::{
 };
 use std::{fmt, path::Path, time::Duration};
 
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 const APPLICATION_ID: i64 = 0x48544c4b;
 const SCHEMA: &str = include_str!("store.sql");
 const REGISTRATION_SCHEMA: &str = include_str!("store_registration.sql");
@@ -31,6 +31,9 @@ const MCP_REMOTE_TASKS_SCHEMA: &str = include_str!("store_mcp_remote_tasks.sql")
 const INSPECTION_SCHEMA: &str = include_str!("store_inspection.sql");
 #[path = "store_inspection.rs"]
 mod inspection;
+pub(crate) use inspection::ProjectionBatch;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) use inspection::flush_projection;
 pub use inspection::{
     HistoricalRecord, InspectionArtifactState, InspectionChange, InspectionRunFilter,
     InspectionRunPage, InspectionSnapshot, StorePosition,
@@ -1183,7 +1186,7 @@ mod tests {
                 .connection
                 .call(|db| {
                     db.execute(
-                        "UPDATE records SET payload=x'ff' WHERE record_id='node'",
+                        "UPDATE checkpoint_payloads SET payload=x'ff' WHERE payload_digest IN (SELECT payload_digest FROM record_heads WHERE record_id='node')",
                         [],
                     )
                 })

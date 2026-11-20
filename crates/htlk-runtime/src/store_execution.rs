@@ -283,7 +283,7 @@ impl SqliteStore {
             let old:Option<Vec<u8>>=tx.query_row("SELECT payload FROM records WHERE run_id=?1 AND family='reply' AND record_id=?2",params![run.as_str(),write.key.id],|r|r.get(0)).optional()?;
             if let Some(old)=old{if old!=payload{return Err(StoreError::IdempotencyConflict)}return Ok(response)}
             let now=observed.max(header.last_time_ms);let sequence=header.sequence.checked_add(1).ok_or(StoreError::Invalid)?;
-            tx.execute("INSERT INTO records(run_id,family,record_id,revision,final,payload) VALUES(?1,'reply',?2,1,1,?3)",params![run.as_str(),write.key.id,payload])?;
+            transitions::write_checkpoint(&tx, &run, &write, 1, &payload)?;
             tx.execute("UPDATE runs SET sequence=?2,last_time_ms=?3 WHERE run_id=?1",params![run.as_str(),sequence,now])?;
             append_event(&tx,run.as_str(),sequence,EventMeta{kind:"terminal_receipt",actor:&actor,timestamp:now,causation:&method,command:Some(&write.key.id)},&event,&limits)?;
             tx.commit()?;Ok(response)

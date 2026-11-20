@@ -747,6 +747,9 @@ async fn measure(config: Config) -> Result<()> {
     if config.recovery_samples > 0 {
         recovery::samples(&database, &reader, registry, &config, graph.fingerprint).await?;
     }
+    let (stored_payload, referenced_payload) = reader.checkpoint_payload_bytes().await?;
+    println!("metadata,checkpoint_stored_bytes,{stored_payload}");
+    println!("metadata,checkpoint_referenced_bytes,{referenced_payload}");
     reader.close().await?;
     let (mut write_operations, mut affected_rows) = (0, 0);
     for (store, before) in stores.into_iter().zip(before) {

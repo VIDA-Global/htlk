@@ -1842,9 +1842,12 @@ mod audit_tests {
             store.validate_run_mcp_interactions(&run_id).await.unwrap();
             // An orphan reservation must still be detected after the last page.
             let run = run_id.clone();
-            store.connection.call(move |db| db.execute("INSERT INTO records(run_id,family,record_id,revision,final,payload) VALUES(?1,'reservation','client:orphan',1,0,x'a0')", [run.as_str()])).await.unwrap();
+            store.connection.call(move |db| -> Result<_, StoreError> {
+                let payload = transitions::checkpoint_payload(db, &[0xa0])?;
+                Ok(db.execute("INSERT INTO record_heads(run_id,family,record_id,revision,final,payload_digest) VALUES(?1,'reservation','client:orphan',1,0,?2)", params![run.as_str(), payload])?)
+            }).await.unwrap();
             assert_eq!(store.validate_run_mcp_interactions(&run_id).await.unwrap_err(), StoreError::Corrupt);
-            store.connection.call(|db| db.execute("DELETE FROM records WHERE record_id='client:orphan'", [])).await.unwrap();
+            store.connection.call(|db| db.execute("DELETE FROM record_heads WHERE record_id='client:orphan'", [])).await.unwrap();
             // Corruption in a later page cannot be skipped by bounded iteration.
             store.connection.call(|db| db.execute("UPDATE mcp_interactions SET raw_digest=?1 WHERE interaction_id=(SELECT max(interaction_id) FROM mcp_interactions)", [hash_bytes(b"wrong").to_string()])).await.unwrap();
             assert_eq!(store.validate_run_mcp_interactions(&run_id).await.unwrap_err(), StoreError::Corrupt);

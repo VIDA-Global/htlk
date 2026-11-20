@@ -134,6 +134,17 @@ pub struct InspectionChange {
 }
 
 impl Store {
+    /// Measures the stored canonical checkpoint bytes and the sum of their sizes
+    /// over live and historical references. Excludes the journal, keys, indexes,
+    /// and separately stored artifact bytes. Intended for offline measurement.
+    ///
+    /// # Errors
+    /// Returns a storage failure or a count outside the supported integer range.
+    pub async fn checkpoint_payload_bytes(&self) -> Result<(u64, u64), StoreError> {
+        self.connection.read(|db| {
+            Ok(db.query_row("SELECT (SELECT coalesce(sum(length(payload)),0) FROM checkpoint_payloads),(SELECT coalesce(sum(length(p.payload)),0) FROM record_heads h JOIN checkpoint_payloads p USING(payload_digest))+(SELECT coalesce(sum(length(p.payload)),0) FROM inspection_records v JOIN checkpoint_payloads p USING(payload_digest))", [], |row| Ok((row.get(0)?, row.get(1)?)))?)
+        }).await.map_err(StoreError::from_worker)
+    }
     /// Resolve one accepted artifact's original producing run at a committed pin.
     /// The accepted identity index is immutable; the historical key creation bound
     /// excludes artifacts first published after `at`. No latest payload, adjunct
@@ -520,7 +531,7 @@ fn historical_record(
     position: i64,
     limits: &Limits,
 ) -> Result<StoredRecord, StoreError> {
-    let (revision,final_record,raw) = db.query_row("SELECT revision,final,payload FROM inspection_records WHERE record_number=?1 AND position<=?2 ORDER BY position DESC LIMIT 1",params![number,position],|row| Ok((row.get::<_,i64>(0)?,row.get::<_,bool>(1)?,row.get::<_,Vec<u8>>(2)?)))?;
+    let (revision,final_record,raw) = db.query_row("SELECT v.revision,v.final,p.payload FROM inspection_records v LEFT JOIN checkpoint_payloads p USING(payload_digest) WHERE v.record_number=?1 AND v.position<=?2 ORDER BY v.position DESC LIMIT 1",params![number,position],|row| Ok((row.get::<_,i64>(0)?,row.get::<_,bool>(1)?,row.get::<_,Vec<u8>>(2)?)))?;
     if number < 1 || revision < 1 {
         return Err(StoreError::Corrupt);
     }
@@ -586,8 +597,25 @@ impl<'a> PageBudget<'a> {
     }
 }
 
-// Called only by append_event, after authoritative rows and outbox were written.
-// Multiple events in the same transaction overwrite the same header boundary.
+#[derive(Default)]
+pub(crate) struct ProjectionBatch {
+    events: Vec<(String, Vec<RecordKey>)>,
+    bytes: usize,
+}
+
+impl ProjectionBatch {
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub(crate) fn mark(&self) -> (usize, usize) {
+        (self.events.len(), self.bytes)
+    }
+    pub(crate) fn restore(&mut self, (count, bytes): (usize, usize)) {
+        self.events.truncate(count);
+        self.bytes = bytes;
+    }
+}
+
+// Decode only the journal's change identities now. The physical commit reads
+// final versions and publishes one boundary, even across released savepoints.
 pub(super) fn project(
     tx: &rusqlite::Transaction<'_>,
     run: &str,
@@ -595,41 +623,7 @@ pub(super) fn project(
     payload: &[u8],
     limits: &Limits,
 ) -> Result<(), StoreError> {
-    let position = if let Some(position) = tx.inspection_position() {
-        position
-    } else {
-        // Serialize publication until physical commit, after independent work
-        // has already run under its own run row lock.
-        let sql = "SELECT position FROM inspection_clock WHERE singleton=1";
-        #[cfg(feature = "postgres")]
-        let sql = if tx.is_postgres() {
-            "SELECT position FROM inspection_clock WHERE singleton=1 FOR UPDATE"
-        } else {
-            sql
-        };
-        let previous: i64 = tx.query_row(sql, [], |r| r.get(0))?;
-        let position = previous.checked_add(1).ok_or(StoreError::Invalid)?;
-        tx.execute(
-            "UPDATE inspection_clock SET position=?1 WHERE singleton=1",
-            [position],
-        )?;
-        tx.set_inspection_position(Some(position));
-        position
-    };
-    tx.execute(
-        "INSERT OR IGNORE INTO inspection_runs(run_id,created_position) VALUES(?1,?2)",
-        params![run, position],
-    )?;
-    let run_number: i64 = tx.query_row(
-        "SELECT run_number FROM inspection_runs WHERE run_id=?1",
-        [run],
-        |r| r.get(0),
-    )?;
-    let sequence: i64 = tx.query_row("SELECT sequence FROM runs WHERE run_id=?1", [run], |r| {
-        r.get(0)
-    })?;
-    tx.execute("INSERT INTO inspection_headers(run_number,position,fingerprint,root_scope,status,sequence,owner,fence,lease_expires_ms,last_time_ms) SELECT ?1,?2,fingerprint,root_scope,status,sequence,owner,fence,lease_expires_ms,last_time_ms FROM runs WHERE run_id=?3 ON CONFLICT(run_number,position) DO UPDATE SET fingerprint=excluded.fingerprint,root_scope=excluded.root_scope,status=excluded.status,sequence=excluded.sequence,owner=excluded.owner,fence=excluded.fence,lease_expires_ms=excluded.lease_expires_ms,last_time_ms=excluded.last_time_ms",params![run_number,position,run])?;
-    tx.execute("INSERT INTO inspection_changes(position,run_number,record_number,sequence) VALUES(?1,?2,0,?3) ON CONFLICT(position,run_number,record_number) DO UPDATE SET sequence=excluded.sequence",params![position,run_number,sequence])?;
+    let mut keys = Vec::new();
     let value = cbor::decode(payload, limits).map_err(|_| StoreError::Corrupt)?;
     let body = match kind {
         "run_initialized" => array(&value)?.first(),
@@ -638,31 +632,108 @@ pub(super) fn project(
         "run_created" | "ownership_acquired" | "ownership_renewed" | "ownership_parked" => None,
         _ => return Err(StoreError::Corrupt),
     };
+    let mut bytes = run.len().saturating_add(128);
     if let Some(body) = body {
-        let writes = array(array(body)?.first().ok_or(StoreError::Corrupt)?)?;
-        for write in writes {
+        for write in array(array(body)?.first().ok_or(StoreError::Corrupt)?)? {
             let fields = array(write)?;
             let (Some(Value::Text(family)), Some(Value::Text(id))) =
                 (fields.first(), fields.get(1))
             else {
                 return Err(StoreError::Corrupt);
             };
-            RecordFamily::parse(family)?;
-            tx.execute("INSERT OR IGNORE INTO inspection_record_keys(run_id,family,record_id,created_position) VALUES(?1,?2,?3,?4)",params![run,family,id,position])?;
-            let record_number:i64 = tx.query_row("SELECT record_number FROM inspection_record_keys WHERE run_id=?1 AND family=?2 AND record_id=?3",params![run,family,id],|r| r.get(0))?;
-            let copied = tx.execute("INSERT INTO inspection_records(record_number,position,revision,final,payload) SELECT ?1,?2,revision,final,payload FROM records WHERE run_id=?3 AND family=?4 AND record_id=?5 ON CONFLICT(record_number,position) DO UPDATE SET revision=excluded.revision,final=excluded.final,payload=excluded.payload",params![record_number,position,run,family,id])?;
-            if copied != 1 {
-                return Err(StoreError::Corrupt);
-            }
-            tx.execute("INSERT INTO inspection_changes(position,run_number,record_number,sequence) VALUES(?1,?2,?3,?4) ON CONFLICT(position,run_number,record_number) DO UPDATE SET sequence=excluded.sequence",params![position,run_number,record_number,sequence])?;
+            bytes = bytes.saturating_add(id.len()).saturating_add(64);
+            keys.push(RecordKey {
+                family: RecordFamily::parse(family)?,
+                id: id.clone(),
+            });
         }
     }
-    // Earlier events in the transaction may also have changed records.
-    tx.execute(
-        "UPDATE inspection_changes SET sequence=?3 WHERE position=?1 AND run_number=?2",
-        params![position, run_number, sequence],
-    )?;
-    tx.execute("INSERT INTO inspection_commits(position,run_upper,record_upper,change_upper) VALUES(?1,(SELECT coalesce(max(run_number),0) FROM inspection_runs),(SELECT coalesce(max(record_number),0) FROM inspection_record_keys),(SELECT coalesce(max(change_id),0) FROM inspection_changes)) ON CONFLICT(position) DO UPDATE SET run_upper=excluded.run_upper,record_upper=excluded.record_upper,change_upper=excluded.change_upper",[position])?;
+    let mut pending = tx.projection().ok_or(StoreError::Database)?.borrow_mut();
+    let total = pending
+        .bytes
+        .checked_add(bytes)
+        .ok_or(StoreError::Invalid)?;
+    if total > limits.max_document_bytes.saturating_mul(16) {
+        return Err(StoreError::Invalid);
+    }
+    pending.bytes = total;
+    pending.events.push((run.into(), keys));
+    Ok(())
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) fn flush_projection(db: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let Some(queue) = db.projection() else {
+        return Ok(());
+    };
+    let ProjectionBatch { events, .. } = std::mem::take(&mut *queue.borrow_mut());
+    if events.is_empty() {
+        return Ok(());
+    }
+    let position = {
+        // Serialize publication until physical commit, after independent work
+        // has already run under its own run row lock.
+        let sql = "SELECT position FROM inspection_clock WHERE singleton=1";
+        #[cfg(feature = "postgres")]
+        let sql = if db.is_postgres() {
+            "SELECT position FROM inspection_clock WHERE singleton=1 FOR UPDATE"
+        } else {
+            sql
+        };
+        let previous: i64 = db.query_row(sql, [], |r| r.get(0))?;
+        let position = previous.checked_add(1).ok_or(rusqlite::Error::Invalid)?;
+        db.execute(
+            "UPDATE inspection_clock SET position=?1 WHERE singleton=1",
+            [position],
+        )?;
+        position
+    };
+    let mut runs = Vec::<(
+        String,
+        Vec<RecordKey>,
+        std::collections::BTreeSet<RecordKey>,
+    )>::new();
+    let mut indexes = std::collections::BTreeMap::new();
+    for (run, keys) in events {
+        let index = *indexes.entry(run.clone()).or_insert_with(|| {
+            runs.push((run, Vec::new(), Default::default()));
+            runs.len() - 1
+        });
+        let (_, ordered, seen) = &mut runs[index];
+        for key in keys {
+            if seen.insert(key.clone()) {
+                ordered.push(key);
+            }
+        }
+    }
+    for (run, keys, _) in runs {
+        db.execute(
+            "INSERT OR IGNORE INTO inspection_runs(run_id,created_position) VALUES(?1,?2)",
+            params![run, position],
+        )?;
+        let run_number: i64 = db.query_row(
+            "SELECT run_number FROM inspection_runs WHERE run_id=?1",
+            [&run],
+            |r| r.get(0),
+        )?;
+        let sequence: i64 =
+            db.query_row("SELECT sequence FROM runs WHERE run_id=?1", [&run], |r| {
+                r.get(0)
+            })?;
+        db.execute("INSERT INTO inspection_headers(run_number,position,fingerprint,root_scope,status,sequence,owner,fence,lease_expires_ms,last_time_ms) SELECT ?1,?2,fingerprint,root_scope,status,sequence,owner,fence,lease_expires_ms,last_time_ms FROM runs WHERE run_id=?3",params![run_number,position,run])?;
+        db.execute("INSERT INTO inspection_changes(position,run_number,record_number,sequence) VALUES(?1,?2,0,?3)",params![position,run_number,sequence])?;
+        for RecordKey { family, id } in keys {
+            let family = family.as_str();
+            db.execute("INSERT OR IGNORE INTO inspection_record_keys(run_id,family,record_id,created_position) VALUES(?1,?2,?3,?4)",params![run,family,id,position])?;
+            let record_number:i64 = db.query_row("SELECT record_number FROM inspection_record_keys WHERE run_id=?1 AND family=?2 AND record_id=?3",params![run,family,id],|r| r.get(0))?;
+            let copied = db.execute("INSERT INTO inspection_records(record_number,position,revision,final,payload_digest) SELECT ?1,?2,revision,final,payload_digest FROM record_heads WHERE run_id=?3 AND family=?4 AND record_id=?5",params![record_number,position,run,family,id])?;
+            if copied != 1 {
+                return Err(rusqlite::Error::Database);
+            }
+            db.execute("INSERT INTO inspection_changes(position,run_number,record_number,sequence) VALUES(?1,?2,?3,?4)",params![position,run_number,record_number,sequence])?;
+        }
+    }
+    db.execute("INSERT INTO inspection_commits(position,run_upper,record_upper,change_upper) VALUES(?1,(SELECT coalesce(max(run_number),0) FROM inspection_runs),(SELECT coalesce(max(record_number),0) FROM inspection_record_keys),(SELECT coalesce(max(change_id),0) FROM inspection_changes))",[position])?;
     Ok(())
 }
 fn array(value: &Value) -> Result<&[Value], StoreError> {

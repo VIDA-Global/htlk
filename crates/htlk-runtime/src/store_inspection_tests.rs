@@ -65,6 +65,8 @@ async fn frozen_contract(store: &Store) {
         1,
     );
     store.commit(&lease, initial.clone()).await.unwrap();
+    // These two one-byte checkpoints each have live and historical references.
+    assert_eq!(store.checkpoint_payload_bytes().await.unwrap(), (2, 4));
     let frozen = store
         .open_inspection_snapshot(&run.run_id, None)
         .await

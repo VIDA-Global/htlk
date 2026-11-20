@@ -7,8 +7,8 @@ records are not an additional supported wire format.
 
 ## Storage compatibility
 
-The SQLite application ID is `0x48544c4b`; the private schema version is **16**.
-An empty database initializes in one immediate transaction. Versions 1–15, future
+The SQLite application ID is `0x48544c4b`; the private schema version is **17**.
+An empty database initializes in one immediate transaction. Versions 1–16, future
 versions, foreign application IDs, and nonempty unrecognized databases fail without
 relabeling or deletion. There is no automatic migration or legacy binding decoder.
 Matching `0.1` format labels do not permit changed interpretation of saved effects.
@@ -62,16 +62,20 @@ does not acquire provider capabilities.
 
 ### Historical inspection projections
 
-`append_event` maintains `inspection_headers`, `inspection_records`, stable run/record
-ordinal catalogs and `inspection_changes` inside the authoritative journal/outbox
-transaction. These projections are read indexes, not a replacement recovery journal.
+`append_event` queues bounded record identities for `inspection_headers`,
+`inspection_records`, stable run/record ordinal catalogs and `inspection_changes`.
+The worker publishes those projections inside the authoritative transaction, once
+per physical commit. These read indexes are not a replacement recovery journal.
 They never contain artifact value blobs or become retention roots. Artifact producer
 index rebuilding does not rewrite historical projections or accepted outcomes.
 
-`inspection_clock` allocates a transactional position on the first journaled fact.
-Multiple events overwrite the same transaction's projected header/record version;
-the final per-run journal sequence bounds all its feed entries. PostgreSQL shares the
-position across released domain savepoints and restores the cached value on rollback.
+`inspection_clock` allocates a transactional position just before publication.
+Repeated changes to one record in a transaction project only its final version;
+the final per-run journal sequence bounds all its feed entries. PostgreSQL accumulates
+identities across released savepoints and discards rolled-back identities.
+Current and historical records reference the same immutable canonical checkpoint
+bytes. Content keys are checked against exact bytes on reuse. Checkpoint bytes are
+separate from artifact values and follow journal history retention.
 Creation plus initialization therefore exposes one committed initialized boundary,
 not an addressable prefix at sequence one. Failed transactions publish no position,
 version or change. The store namespace survives reopen; explicit disposable-state
@@ -106,14 +110,15 @@ covers caller procedures.
 The optional `postgres` feature provides native PostgreSQL tables in a dedicated
 host-selected schema. `PostgresStore::initialize` transactionally creates an empty
 recognized layout; `PostgresStore::open` requires existing state. The metadata
-application is `htlk.runtime.postgres`, layout version **3**. Initialization and
+application is `htlk.runtime.postgres`, layout version **4**. Initialization and
 opening also compare the exact embedded layout digest; a matching version label
 cannot reinterpret a different private layout. Initialization and
 multi-domain operations use an exclusive database/schema-scoped transaction
 advisory lock. Ordinary commits, acquisition, renewal, and parking take the shared
 form of that gate and then lock only the target run row. Exclusive operations
-coordinate retention, callback accounting, initialization, and the durable time
-watermark against those run writers. Journaled writers lock the inspection clock
+coordinate retention, callback accounting, initialization, and ID-block reservation
+against those run writers. Time probes are read-only and account for committed run
+timestamps. Journaled writers lock the inspection clock
 at publication and hold it through physical commit, preserving committed positions
 and ordinals. Domain write boundaries use savepoints inside READ COMMITTED
 transactions. Selected scheduling, journal, and historical reads use REPEATABLE

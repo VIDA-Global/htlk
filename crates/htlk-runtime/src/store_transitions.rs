@@ -587,9 +587,7 @@ impl PreparedTransition {
                 return Err(StoreError::Conflict);
             }
             let revision = next_revision(write.expected_revision)?;
-            tx.execute("INSERT INTO records(run_id,family,record_id,revision,final,payload) VALUES(?1,?2,?3,?4,?5,?6)
-                ON CONFLICT(run_id,family,record_id) DO UPDATE SET revision=excluded.revision,final=excluded.final,payload=excluded.payload",
-                params![lease.run_id.as_str(), write.key.family.as_str(), write.key.id, revision, write.final_record, payload])?;
+            write_checkpoint(tx, &lease.run_id, write, revision, payload)?;
         }
         retention::check_references(tx, &transition.writes, limits)?;
         artifacts::check_output_publication(tx, &lease.run_id, &transition.writes, limits)?;
@@ -629,6 +627,42 @@ impl PreparedTransition {
         )?;
         Ok(CommitReceipt { sequence })
     }
+}
+
+pub(super) fn checkpoint_payload(
+    db: &rusqlite::Connection,
+    payload: &[u8],
+) -> Result<String, StoreError> {
+    let digest = htlk_executable::digest::hash_bytes(payload).to_string();
+    if db.execute(
+        "INSERT OR IGNORE INTO checkpoint_payloads(payload_digest,payload) VALUES(?1,?2)",
+        params![digest, payload],
+    )? == 0
+    {
+        let exact = db.query_row(
+            "SELECT payload=?2 FROM checkpoint_payloads WHERE payload_digest=?1",
+            params![digest, payload],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exact {
+            return Err(StoreError::Corrupt);
+        }
+    }
+    Ok(digest)
+}
+
+pub(super) fn write_checkpoint(
+    tx: &rusqlite::Transaction<'_>,
+    run: &RunId,
+    write: &RecordWrite,
+    revision: i64,
+    payload: &[u8],
+) -> Result<(), StoreError> {
+    let digest = checkpoint_payload(tx, payload)?;
+    tx.execute("INSERT INTO record_heads(run_id,family,record_id,revision,final,payload_digest) VALUES(?1,?2,?3,?4,?5,?6)
+        ON CONFLICT(run_id,family,record_id) DO UPDATE SET revision=excluded.revision,final=excluded.final,payload_digest=excluded.payload_digest",
+        params![run.as_str(), write.key.family.as_str(), write.key.id, revision, write.final_record, digest])?;
+    Ok(())
 }
 
 pub(super) fn next_revision(previous: Option<i64>) -> Result<i64, StoreError> {

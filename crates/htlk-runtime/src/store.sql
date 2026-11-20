@@ -37,16 +37,23 @@ CREATE TABLE outbox (
 CREATE INDEX outbox_pending ON outbox(delivered,run_id,sequence);
 -- Each family retains its typed runtime record schema; these rows are not a
 -- second graph. Immutable/final records cannot be revised by normal transitions.
-CREATE TABLE records (
+CREATE TABLE checkpoint_payloads (
+    payload_digest TEXT PRIMARY KEY,
+    payload BLOB NOT NULL
+) STRICT;
+CREATE TABLE record_heads (
     run_id TEXT NOT NULL REFERENCES runs(run_id),
     family TEXT NOT NULL,
     record_id TEXT NOT NULL,
     revision INTEGER NOT NULL CHECK(revision >= 1),
     final INTEGER NOT NULL CHECK(final IN (0,1)),
-    payload BLOB NOT NULL,
+    payload_digest TEXT NOT NULL REFERENCES checkpoint_payloads(payload_digest),
     PRIMARY KEY(run_id,family,record_id)
 ) STRICT;
-CREATE INDEX artifact_tombstones_by_id ON records(record_id) WHERE family='tombstone';
+CREATE INDEX artifact_tombstones_by_id ON record_heads(record_id) WHERE family='tombstone';
+CREATE VIEW records AS
+    SELECT h.run_id,h.family,h.record_id,h.revision,h.final,p.payload,h.payload_digest
+    FROM record_heads h LEFT JOIN checkpoint_payloads p USING(payload_digest);
 CREATE TABLE commands (
     run_id TEXT NOT NULL,
     command_id TEXT NOT NULL,

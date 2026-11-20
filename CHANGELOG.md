@@ -16,6 +16,9 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ### Changed
 
+- Current and historical records share immutable checkpoint payloads, and
+  historical projections publish once per physical commit. This changes native
+  identities and requires SQLite layout 17 or PostgreSQL layout 4.
 - Scheduling time probes and host receipt lookups are read-only. Run-ID
   allocation reserves durable blocks, and execution commits normalize time in
   the accepting transaction.

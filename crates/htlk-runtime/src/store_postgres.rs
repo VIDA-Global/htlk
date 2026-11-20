@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const APPLICATION_ID: &str = "htlk.runtime.postgres";
 const SCHEMA: &str = include_str!("store_postgres.sql");
 
@@ -155,7 +155,7 @@ pub(crate) struct Database {
     cursor_failed: Cell<bool>,
     statements: RefCell<BTreeMap<String, postgres::Statement>>,
     maximum_field_bytes: i64,
-    pub(crate) inspection_position: Cell<Option<i64>>,
+    pub(crate) projection: RefCell<crate::store::ProjectionBatch>,
 }
 impl Database {
     fn connect(
@@ -281,7 +281,7 @@ impl Database {
             cursor_failed: Cell::new(false),
             statements: RefCell::new(BTreeMap::new()),
             maximum_field_bytes,
-            inspection_position: Cell::new(None),
+            projection: Default::default(),
         })
     }
     pub(crate) fn begin(&self, mode: OperationMode) -> store_db::Result<()> {
@@ -293,7 +293,6 @@ impl Database {
             .borrow()
             .set_deadline(Some(Instant::now() + self.settings.operation_timeout));
         self.cursor_failed.set(false);
-        self.inspection_position.set(None);
         let result = match mode {
             OperationMode::Read => self.batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"),
             OperationMode::Exclusive => self.batch("BEGIN ISOLATION LEVEL READ COMMITTED; SELECT pg_advisory_xact_lock(hashtextextended(current_database() || ':' || current_schema(), 1213484107))"),
