@@ -93,18 +93,8 @@ jobs:
       - name: Test documentation, coverage and discovery helpers
         run: node --test tools/validate-docs.test.mjs tools/coverage.test.mjs tools/discover-mcp.test.mjs
 
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: Check independent backend feature builds
-        run: |
-          cargo check -p htlk-runtime --no-default-features --lib --locked
-          cargo check -p htlk-runtime --no-default-features --features sqlite --all-targets --locked
-          cargo check -p htlk-runtime --no-default-features --features postgres --all-targets --locked
-          cargo check -p htlk --no-default-features --features postgres --all-targets --locked
+      - name: Check formatting, compilation and Clippy across backend features
+        run: bash tools/check-rust.sh
 
       - name: Run tests
         run: cargo test --workspace --all-features --locked

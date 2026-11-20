@@ -9,7 +9,35 @@ use crate::{
     executable::*,
     input_value::*,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map::Entry};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CatalogKind {
+    Tool,
+    Resource,
+    Template,
+    Prompt,
+}
+
+impl CatalogKind {
+    fn collection(self) -> &'static str {
+        match self {
+            Self::Tool => "tools",
+            Self::Resource => "resources",
+            Self::Template => "templates",
+            Self::Prompt => "prompts",
+        }
+    }
+
+    fn descriptor_fields(self) -> (McpDescriptorKind, &'static str) {
+        match self {
+            Self::Tool => (McpDescriptorKind::Tool, "name"),
+            Self::Resource => (McpDescriptorKind::Resource, "uri"),
+            Self::Template => (McpDescriptorKind::ResourceTemplate, "uriTemplate"),
+            Self::Prompt => (McpDescriptorKind::Prompt, "name"),
+        }
+    }
+}
 
 /// Validated, immutable snapshots of exactly three MCP catalogs.
 #[derive(Clone, Debug)]
@@ -17,7 +45,7 @@ pub struct MCPCatalogInputs {
     bytes: usize,
     depth: usize,
     pub(crate) servers: BTreeMap<String, ServerIdentity>,
-    pub(crate) entries: BTreeMap<(Digest, String, String), JsonDocument>,
+    entries: BTreeMap<(Digest, CatalogKind), BTreeMap<String, JsonDocument>>,
     pub(crate) schemas: BTreeMap<String, JsonDocument>,
 }
 impl MCPCatalogInputs {
@@ -53,9 +81,12 @@ impl MCPCatalogInputs {
             schemas: BTreeMap::new(),
         };
         for (category, collections) in [
-            ("tools", &["tools"][..]),
-            ("resources", &["resources", "templates"][..]),
-            ("prompts", &["prompts"][..]),
+            ("tools", &[CatalogKind::Tool][..]),
+            (
+                "resources",
+                &[CatalogKind::Resource, CatalogKind::Template][..],
+            ),
+            ("prompts", &[CatalogKind::Prompt][..]),
         ] {
             let mut names = vec![
                 "catalog_version",
@@ -63,7 +94,7 @@ impl MCPCatalogInputs {
                 "servers",
                 "schema_documents",
             ];
-            names.extend_from_slice(collections);
+            names.extend(collections.iter().map(|kind| kind.collection()));
             let c = closed(field(root, category)?, &names, &[])?;
             if text(field(c, "catalog_version")?)? != "0.1"
                 || text(field(c, "mcp_protocol_version")?)? != MCP_PROTOCOL_VERSION
@@ -79,7 +110,7 @@ impl MCPCatalogInputs {
                 if result.servers.get(alias).is_some_and(|s| s != &server) {
                     return Err(fail("C_MCP", "conflicting server alias"));
                 }
-                local.insert(alias.to_owned(), server.clone());
+                local.insert(alias, server.clone());
                 result.servers.insert(alias.to_owned(), server);
             }
             for (uri, value) in map(field(c, "schema_documents")?)?.iter() {
@@ -92,14 +123,9 @@ impl MCPCatalogInputs {
                 }
                 result.schemas.insert(uri.to_owned(), doc);
             }
-            for collection in collections {
-                let (kind, key) = match *collection {
-                    "tools" => (McpDescriptorKind::Tool, "name"),
-                    "resources" => (McpDescriptorKind::Resource, "uri"),
-                    "templates" => (McpDescriptorKind::ResourceTemplate, "uriTemplate"),
-                    _ => (McpDescriptorKind::Prompt, "name"),
-                };
-                for value in array(field(c, collection)?)? {
+            for &kind in collections {
+                let (protocol_kind, key) = kind.descriptor_fields();
+                for value in array(field(c, kind.collection())?)? {
                     let e = closed(
                         value,
                         &["server", "descriptor"],
@@ -111,7 +137,8 @@ impl MCPCatalogInputs {
                         .ok_or_else(|| fail("C_MCP", "unknown catalog server alias"))?;
                     let descriptor = JsonDocument::from_value(field(e, "descriptor")?, l)
                         .map_err(|e| fail("C_MCP", e))?;
-                    validate_mcp_descriptor(kind, &descriptor, l).map_err(|e| fail("C_MCP", e))?;
+                    validate_mcp_descriptor(protocol_kind, &descriptor, l)
+                        .map_err(|e| fail("C_MCP", e))?;
                     if let Some(pin) = e.get("expected_descriptor_digest") {
                         let pin: Digest = text(pin)?.parse().map_err(|e| fail("C_MCP", e))?;
                         if pin != descriptor.digest() {
@@ -119,15 +146,21 @@ impl MCPCatalogInputs {
                         }
                     }
                     let selection = text(field(map(descriptor.value())?, key)?)?.to_owned();
-                    let id = (
-                        server.digest(l).map_err(|e| fail("C_MCP", e))?,
-                        collection.to_string(),
-                        selection,
-                    );
-                    if result.entries.get(&id).is_some_and(|d| d != &descriptor) {
-                        return Err(fail("C_MCP", "conflicting operation descriptors"));
+                    let digest = server.digest(l).map_err(|e| fail("C_MCP", e))?;
+                    match result
+                        .entries
+                        .entry((digest, kind))
+                        .or_default()
+                        .entry(selection)
+                    {
+                        Entry::Vacant(entry) => {
+                            entry.insert(descriptor);
+                        }
+                        Entry::Occupied(entry) if entry.get() != &descriptor => {
+                            return Err(fail("C_MCP", "conflicting operation descriptors"));
+                        }
+                        Entry::Occupied(_) => {}
                     }
-                    result.entries.insert(id, descriptor);
                 }
             }
         }
@@ -143,19 +176,13 @@ impl MCPCatalogInputs {
         Ok(())
     }
     pub(crate) fn descriptor(&self, binding: &McpBinding, l: &Limits) -> Result<&JsonDocument> {
-        let (category, selection) = match binding.kind() {
-            McpBindingKind::Tool { name, .. } => ("tools", name),
-            McpBindingKind::Resource { uri } => ("resources", uri),
-            McpBindingKind::Template { uri_template } => ("templates", uri_template),
-            McpBindingKind::Prompt { name } => ("prompts", name),
+        let (kind, selection) = match binding.kind() {
+            McpBindingKind::Tool { name, .. } => (CatalogKind::Tool, name),
+            McpBindingKind::Resource { uri } => (CatalogKind::Resource, uri),
+            McpBindingKind::Template { uri_template } => (CatalogKind::Template, uri_template),
+            McpBindingKind::Prompt { name } => (CatalogKind::Prompt, name),
         };
-        let id = (
-            binding.server().digest(l).map_err(|e| fail("C_MCP", e))?,
-            category.into(),
-            selection.clone(),
-        );
-        self.entries
-            .get(&id)
+        self.lookup(binding.server(), kind, selection, l)?
             .filter(|d| d.digest() == binding.descriptor())
             .ok_or_else(|| {
                 fail(
@@ -163,6 +190,20 @@ impl MCPCatalogInputs {
                     "selected descriptor does not match supplied catalogs",
                 )
             })
+    }
+
+    pub(crate) fn lookup(
+        &self,
+        server: &ServerIdentity,
+        kind: CatalogKind,
+        selection: &str,
+        limits: &Limits,
+    ) -> Result<Option<&JsonDocument>> {
+        let digest = server.digest(limits).map_err(|e| fail("C_MCP", e))?;
+        Ok(self
+            .entries
+            .get(&(digest, kind))
+            .and_then(|entries| entries.get(selection)))
     }
 }
 fn value_depth(v: &Value) -> usize {

@@ -7,6 +7,7 @@ use crate::executable::{
 use crate::{
     Compiler, DiagnosticLocation, MCPCatalogInputs, SourceMapEntry,
     ast::*,
+    catalogs::CatalogKind,
     diagnostic::{Result, fail},
     executable::*,
 };
@@ -192,16 +193,12 @@ impl<'a> Session<'a> {
                 .len()
                 .saturating_add(self.documentation.len()),
         )?;
-        let bytes = self.diagnostic_bytes.saturating_add(
-            self.source_map
-                .iter()
-                .fold(0usize, |n, e| {
-                    n.saturating_add(crate::diagnostic::map_size(e))
-                })
-                .saturating_add(self.documentation.iter().fold(0usize, |n, (k, v)| {
-                    n.saturating_add(k.len()).saturating_add(v.len())
-                })),
-        );
+        let bytes = self
+            .diagnostic_bytes
+            .saturating_add(crate::diagnostic::provenance_bytes(
+                &self.source_map,
+                &self.documentation,
+            ));
         if bytes > self.compiler.config.frontend.max_report_bytes {
             return Err(fail(
                 "C_SOURCE_LIMIT",
@@ -937,9 +934,9 @@ impl<'a> Session<'a> {
                     outputs,
                 )
             }
-            AstOperation::Mcp(category, server, selection) => {
+            AstOperation::Mcp(kind, server, selection) => {
                 let (binding, inputs, outputs) =
-                    self.mcp(category, server, selection, b.pin.as_deref())?;
+                    self.mcp(*kind, server, selection, b.pin.as_deref())?;
                 let retry = if let Some(retry) = &b.retry {
                     let count = literal_value(&retry["max_attempts"])?;
                     let on = literal_value(&retry["on"])?;
@@ -978,7 +975,7 @@ impl<'a> Session<'a> {
     }
     fn mcp(
         &mut self,
-        category: &str,
+        kind: CatalogKind,
         alias: &str,
         selection: &str,
         pin: Option<&str>,
@@ -990,20 +987,9 @@ impl<'a> Session<'a> {
             .get(alias)
             .ok_or_else(|| fail("C_MCP", "unknown MCP server alias"))?
             .clone();
-        let category = match category {
-            "tool" => "tools",
-            "resource" => "resources",
-            "template" => "templates",
-            _ => "prompts",
-        };
         let descriptor = self
             .catalogs
-            .entries
-            .get(&(
-                server.digest(self.l()).map_err(|e| fail("C_MCP", e))?,
-                category.into(),
-                selection.into(),
-            ))
+            .lookup(&server, kind, selection, self.l())?
             .ok_or_else(|| fail("C_MCP", "unknown MCP selection"))?
             .clone();
         if let Some(pin) = pin {
@@ -1012,8 +998,8 @@ impl<'a> Session<'a> {
                 return Err(fail("C_MCP", "source pin mismatch"));
             }
         }
-        let (kind, inputs, output) = match category {
-            "tools" => {
+        let (kind, inputs, output) = match kind {
+            CatalogKind::Tool => {
                 let d = map(descriptor.value())?;
                 let input = JsonDocument::from_value(field(d, "inputSchema")?, self.l())
                     .map_err(|e| fail("C_SCHEMA", e))?;
@@ -1047,14 +1033,14 @@ impl<'a> Session<'a> {
                     ValueType::builtin(BuiltinType::McpToolResult),
                 )
             }
-            "resources" => (
+            CatalogKind::Resource => (
                 McpBindingKind::Resource {
                     uri: selection.into(),
                 },
                 PortTable::default(),
                 ValueType::builtin(BuiltinType::McpResourceResult),
             ),
-            "templates" => {
+            CatalogKind::Template => {
                 let names =
                     uri_template_variables(selection, self.l()).map_err(|e| fail("C_MCP", e))?;
                 let fields = names
@@ -1078,7 +1064,7 @@ impl<'a> Session<'a> {
                     ValueType::builtin(BuiltinType::McpResourceResult),
                 )
             }
-            _ => {
+            CatalogKind::Prompt => {
                 let d = map(descriptor.value())?;
                 let mut fields = vec![];
                 if let Some(arguments) = d.get("arguments") {
@@ -1284,14 +1270,9 @@ impl<'a> Session<'a> {
                 d
             }));
         crate::diagnostic::sort(&mut success.diagnostics);
-        let bytes = success.source_map.iter().fold(0usize, |n, e| {
-            n.saturating_add(crate::diagnostic::map_size(e))
-        }) + success.documentation.iter().fold(0usize, |n, (p, d)| {
-            n.saturating_add(p.len()).saturating_add(d.len())
-        });
-        let bytes = success.diagnostics.iter().fold(bytes, |n, d| {
-            n.saturating_add(crate::diagnostic::diagnostic_size(d))
-        });
+        let bytes =
+            crate::diagnostic::provenance_bytes(&success.source_map, &success.documentation)
+                .saturating_add(crate::diagnostic::diagnostic_bytes(&success.diagnostics));
         if bytes > self.compiler.config.frontend.max_report_bytes {
             return Err(fail("C_SOURCE_LIMIT", "compiler report limit exceeded"));
         }

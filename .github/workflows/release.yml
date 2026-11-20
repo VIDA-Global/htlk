@@ -100,12 +100,13 @@ jobs:
       - name: Independently validate executable fixtures
         run: node tools/validate-executable-fixtures.mjs
 
-      - name: Validate workspace
+      - name: Check formatting, compilation and Clippy across backend features
+        run: bash tools/check-rust.sh
+
+      - name: Test workspace and build documentation
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
-          cargo fmt --all --check
-          cargo clippy --workspace --all-targets --all-features -- -D warnings
           cargo test --workspace --all-features --locked
           cargo doc --workspace --all-features --no-deps --locked
 

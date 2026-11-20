@@ -1,5 +1,7 @@
 //! Shared full-stack fixtures; every external service is an isolated local peer.
-use crate::support::store::TestStore as SqliteStore;
+#[path = "inspection.rs"]
+mod inspection_poll;
+use crate::support::store::TestStore;
 use execution::{ExecutionConfig, ExecutionEngine, RunView};
 use failure::{FailureCode, RuntimeFailure};
 use htlk::{compiler::*, runtime::*};
@@ -209,21 +211,7 @@ pub fn caller() -> HostContext {
 pub async fn inspect(runtime: &Runtime, run: &RunId) -> RunView {
     let deadline =
         Instant::now() + Duration::from_millis(crate::support::store::io_budget_ms(20000));
-    loop {
-        match runtime.inspect_run(&caller(), run).await {
-            Ok(view) => return view,
-            // Inspection deliberately rejects a snapshot when a coordinator
-            // commits between its reads. Retry that exact transient category.
-            Err(error) if error.code() == FailureCode::Fenced => {
-                assert!(
-                    Instant::now() < deadline,
-                    "inspection never settled: {error}"
-                );
-            }
-            Err(error) => panic!("run inspection failed: {error:?}"),
-        }
-        actix::clock::sleep(Duration::from_millis(2)).await;
-    }
+    inspection_poll::inspect_when_stable(runtime, &caller(), run, deadline).await
 }
 
 pub async fn terminal(runtime: &Runtime, run: &RunId) -> RunView {
@@ -316,7 +304,7 @@ pub async fn assert_replay(store: &Store, run: &RunId) {
 
 pub struct Harness {
     pub runtime: Arc<Runtime>,
-    pub store: SqliteStore,
+    pub store: TestStore,
     pub compiler: Compiler,
     pub engine: ExecutionEngine,
     _directory: TempDir,
@@ -338,7 +326,7 @@ impl Harness {
             crate::support::store::io_budget_ms(30000),
             crate::support::store::io_budget_ms(10000),
         );
-        let store = SqliteStore::open(
+        let store = TestStore::open(
             directory.path().join("runtime.sqlite"),
             StoreConfig::default(),
         )

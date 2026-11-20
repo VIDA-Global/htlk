@@ -1,5 +1,9 @@
 //! Specification reducer scenarios, independent state oracle and completion order.
-use htlk_executable::{BuiltinType, Port, PortTable, ValueType, cbor::Limits, digest::Digest};
+use htlk_executable::{
+    BuiltinType, Port, PortTable, ValueType,
+    cbor::{LimitKind, Limits},
+    digest::Digest,
+};
 use htlk_runtime::{
     binding::*,
     failure::{FailureCode, RuntimeFailure},
@@ -431,6 +435,36 @@ fn all_input_settlement_precedes_errors_which_precede_required_absence() {
         .unwrap(),
         AdmissionDecision::InputsReady(_)
     ));
+}
+
+#[test]
+fn a_later_guard_exhausting_the_aggregate_budget_never_reads_the_selected_source() {
+    let edges = ["b".parse().unwrap(), "a".parse().unwrap()];
+    let limits = Limits {
+        max_document_bytes: 8,
+        ..Limits::default()
+    };
+    let mut order = Vec::new();
+    let result = reduce_binding(
+        &edges,
+        |edge| {
+            order.push(edge.as_str().to_owned());
+            if edge.as_str() == "a" {
+                guard(GuardState::Value(true))
+            } else {
+                GuardEvaluation {
+                    state: GuardState::Value(false),
+                    influence: labels(&["x"]),
+                    causes: vec![],
+                }
+            }
+        },
+        |_| panic!("the selected source must stay unread until every guard is budgeted"),
+        &limits,
+    );
+    assert_eq!(order, ["a", "b"]);
+    assert!(matches!(result, Err(ReducerError::Encoding(error))
+        if error.limit == LimitKind::DocumentBytes && error.maximum == 8));
 }
 
 #[test]

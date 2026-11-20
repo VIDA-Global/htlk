@@ -1,6 +1,7 @@
 //! Portable compiler reports, independent of terminal rendering.
 use crate::analyzer::{AnalysisDiagnostic, DiagnosticSeverity};
 use crate::executable::digest::Digest;
+use std::collections::BTreeMap;
 
 /// Identity of one immutable source string.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -88,7 +89,7 @@ fn source_size(s: &SourceLocation) -> usize {
         } => module_path.len().saturating_add(source_path.len()),
     }
 }
-pub(crate) fn map_size(e: &SourceMapEntry) -> usize {
+fn map_size(e: &SourceMapEntry) -> usize {
     size_of::<SourceMapEntry>()
         .saturating_add(e.canonical_path.len())
         .saturating_add(source_size(&e.span.source))
@@ -110,6 +111,26 @@ pub(crate) fn diagnostic_size(d: &Diagnostic) -> usize {
             .saturating_add(location(&d.location)),
         |n, l| n.saturating_add(location(l)),
     )
+}
+
+pub(crate) fn diagnostic_bytes(diagnostics: &[Diagnostic]) -> usize {
+    diagnostics
+        .iter()
+        .map(diagnostic_size)
+        .fold(0, usize::saturating_add)
+}
+
+pub(crate) fn provenance_bytes(
+    source_map: &[SourceMapEntry],
+    documentation: &BTreeMap<String, String>,
+) -> usize {
+    let map_bytes = source_map
+        .iter()
+        .map(map_size)
+        .fold(0, usize::saturating_add);
+    documentation.iter().fold(map_bytes, |bytes, (path, text)| {
+        bytes.saturating_add(path.len()).saturating_add(text.len())
+    })
 }
 
 /// Structured compilation error or warning.

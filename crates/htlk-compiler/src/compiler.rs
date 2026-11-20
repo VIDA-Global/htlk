@@ -392,10 +392,8 @@ impl Compiler {
             .map(analysis)
             .collect::<Vec<_>>();
         crate::diagnostic::sort(&mut diagnostics);
-        let report_bytes = diagnostics.iter().fold(0usize, |n, d| {
-            n.saturating_add(crate::diagnostic::diagnostic_size(d))
-        });
-        if report_bytes > self.config.frontend.max_report_bytes {
+        if crate::diagnostic::diagnostic_bytes(&diagnostics) > self.config.frontend.max_report_bytes
+        {
             return Err(fail("C_SOURCE_LIMIT", "diagnostic report limit exceeded"));
         }
         let envelope = analyzed

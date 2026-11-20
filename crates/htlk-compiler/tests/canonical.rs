@@ -616,7 +616,7 @@ fn all_mcp_categories_waits_and_retry_options_lower_to_exact_interfaces() {
         r#"[{"server":"service","descriptor":{"name":"tool","inputSchema":{"type":"object"},"outputSchema":{"type":"object"}}}]"#,
         r#"[{"server":"service","descriptor":{"name":"notes","uri":"file:///notes"}}]"#,
         r#"[{"server":"service","descriptor":{"name":"document","uriTemplate":"file:///docs/{customerId}"}}]"#,
-        r#"[{"server":"service","descriptor":{"name":"prompt","arguments":[{"name":"Content-Type","required":false}]}}]"#,
+        r#"[{"server":"service","descriptor":{"name":"tool","arguments":[{"name":"Content-Type","required":false}]}}]"#,
         "{}",
     );
     let source = r#"ir_version="0.1"
@@ -628,7 +628,7 @@ fn all_mcp_categories_waits_and_retry_options_lower_to_exact_interfaces() {
           tool=call(mcp.tool("service","tool")){retry{max_attempts=2 on=["Z","A","A"] backoff_ms=[0]} limits{attempt_timeout_ms=100 max_mcp_calls=2}}
           resource=read(mcp.resource("service","file:///notes"))
           template=read(mcp.template("service","file:///docs/{customerId}"))
-          prompt=fetch(mcp.prompt("service","prompt"))
+          prompt=fetch(mcp.prompt("service","tool"))
           approval=wait(string){topic="review" timeout_ms=1000}
         }
         edges{
@@ -645,6 +645,10 @@ fn all_mcp_categories_waits_and_retry_options_lower_to_exact_interfaces() {
       }"#;
     let output = compiler.compile_source(source, &catalogs).unwrap();
     assert_eq!(output.canonical_document.fields().bindings.len(), 4);
+    let admitted = compiler
+        .compile_document(output.canonical_document().clone(), &catalogs)
+        .unwrap();
+    assert_eq!(admitted.executable_bytes(), output.executable_bytes());
     let root =
         &output.canonical_document.fields().scopes[&output.canonical_document.fields().root_scope];
     let node = root
@@ -676,6 +680,55 @@ fn all_mcp_categories_waits_and_retry_options_lower_to_exact_interfaces() {
     };
     assert_eq!(fields[0].0, "customerId");
     assert!(fields[0].1.required());
+}
+
+#[test]
+fn identical_tool_names_select_by_compound_server_identity() {
+    let (compiler, _) = compiler();
+    let first =
+        r#"{"name":"lookup","description":"First deployment","inputSchema":{"type":"object"}}"#;
+    let second = first.replace("First", "Second");
+    let inventory = |reverse| {
+        let (a, b) = if reverse {
+            (&*second, first)
+        } else {
+            (first, &*second)
+        };
+        let json = format!(
+            r#"{{
+          "tools":{{"catalog_version":"0.1","mcp_protocol_version":"2025-11-25","schema_documents":{{}},
+            "servers":{{"a":{{"deployment_id":"alpha","transport":"stdio","implementation_name":"fixture","implementation_version":"1"}},
+                        "b":{{"deployment_id":"beta","transport":"stdio","implementation_name":"fixture","implementation_version":"1"}}}},
+            "tools":[{{"server":"a","descriptor":{a}}},{{"server":"b","descriptor":{b}}}]}},
+          "resources":{{"catalog_version":"0.1","mcp_protocol_version":"2025-11-25","servers":{{}},"schema_documents":{{}},"resources":[],"templates":[]}},
+          "prompts":{{"catalog_version":"0.1","mcp_protocol_version":"2025-11-25","servers":{{}},"schema_documents":{{}},"prompts":[]}}
+        }}"#
+        );
+        MCPCatalogInputs::from_json(json.as_bytes(), &Limits::default()).unwrap()
+    };
+    let source = r#"ir_version="0.1" graph test.lookup {
+      inputs={} outputs={value=McpToolResult}
+      nodes{args=eval(json,{}) lookup=call(mcp.tool("b","lookup"))}
+      edges{edge args{from=args.outputs.value to=lookup.inputs.arguments}
+            edge result{from=lookup.outputs.value to=outputs.value}}
+    }"#;
+    let output = compiler.compile_source(source, &inventory(false)).unwrap();
+    let binding = output
+        .canonical_document
+        .fields()
+        .bindings
+        .values()
+        .next()
+        .unwrap();
+    let descriptor = JsonDocument::new(second.as_bytes(), &Limits::default()).unwrap();
+    assert_eq!(binding.descriptor(), descriptor.digest());
+    assert_eq!(
+        compiler
+            .compile_document(output.canonical_document().clone(), &inventory(true))
+            .unwrap_err()
+            .to_string(),
+        "C_MCP: selected descriptor does not match supplied catalogs"
+    );
 }
 
 #[test]
@@ -2690,6 +2743,74 @@ fn canonical_ingress_rechecks_serialization_catalog_and_diagnostic_allowances() 
             .diagnostics[0]
             .code,
         "C_SOURCE_LIMIT"
+    );
+}
+
+#[test]
+fn source_report_limit_counts_warnings_and_retained_provenance() {
+    let (base, _) = compiler();
+    let inventory = catalogs();
+    let source = r#"ir_version="0.1"
+      graph test.overlap {
+        description="Two edges may select the same value."
+        inputs={flag=boolean} outputs={value=boolean} nodes{}
+        edges{edge a{from=inputs.flag to=outputs.value when=inputs.flag}
+              edge b{from=inputs.flag to=outputs.value when=inputs.flag}}
+      }"#;
+    let expected = base.compile_source(source, &inventory).unwrap();
+    assert!(!expected.diagnostics.is_empty());
+    assert!(
+        expected
+            .diagnostics
+            .iter()
+            .all(|diagnostic| { diagnostic.severity == analyzer::DiagnosticSeverity::Warning })
+    );
+    assert!(!expected.source_map.is_empty());
+    assert!(
+        expected
+            .documentation
+            .values()
+            .any(|text| { text == "Two edges may select the same value." })
+    );
+
+    let mut bytes = 0;
+    for entry in &expected.source_map {
+        assert_eq!(entry.span.source, SourceLocation::Inline);
+        bytes += size_of::<SourceMapEntry>() + entry.canonical_path.len();
+        bytes += entry.declaration_name.as_deref().unwrap_or_default().len();
+    }
+    for (path, text) in &expected.documentation {
+        bytes += path.len() + text.len();
+    }
+    for diagnostic in &expected.diagnostics {
+        bytes += size_of::<Diagnostic>() + diagnostic.code.len() + diagnostic.message.len();
+        for location in std::iter::once(&diagnostic.location).chain(&diagnostic.related_locations) {
+            bytes += match location {
+                DiagnosticLocation::SourceSpan(span) => {
+                    assert_eq!(span.source, SourceLocation::Inline);
+                    size_of::<SourceSpan>()
+                }
+                DiagnosticLocation::CanonicalRecordPath(path) => path.len(),
+                other => panic!("unexpected standalone diagnostic location: {other:?}"),
+            };
+        }
+    }
+
+    let compile = |max_report_bytes| {
+        let mut config = base.config().clone();
+        config.frontend.max_report_bytes = max_report_bytes;
+        Compiler::new(config)
+            .unwrap()
+            .compile_source(source, &inventory)
+    };
+    let at_limit = compile(bytes).unwrap();
+    assert_eq!(at_limit.diagnostics, expected.diagnostics);
+    assert_eq!(at_limit.source_map, expected.source_map);
+    assert_eq!(at_limit.documentation, expected.documentation);
+    assert_eq!(at_limit.executable_bytes(), expected.executable_bytes());
+    assert_eq!(
+        compile(bytes - 1).unwrap_err().to_string(),
+        "C_SOURCE_LIMIT: compiler report limit exceeded"
     );
 }
 

@@ -1,6 +1,7 @@
 //! Temporary source syntax. Names and source-only descriptions are erased on lowering.
 use crate::{
     SourceSpan,
+    catalogs::CatalogKind,
     executable::{BinaryOperator, ScalarLiteral},
 };
 use std::collections::BTreeMap;
@@ -64,7 +65,7 @@ pub(crate) struct Block {
 #[derive(Clone, Debug)]
 pub(crate) enum AstOperation {
     Eval(PortTy, Expr),
-    Mcp(String, String, String),
+    Mcp(CatalogKind, String, String),
     Use(String),
     Wait(Ty),
     Loop,
