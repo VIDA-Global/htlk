@@ -278,7 +278,7 @@ inspection readers fixed for each backend.
 | Instrumented baseline | 74,505 | 409,429 | 5,180 | 20,886 | 19.1 MiB |
 | Read-only clock probes and ID blocks | 20,634 | 354,782 | 1,111 | 16,734 | 12.2 MiB |
 | Plus batched pure eval | 10,884 | 364,077 | 874 | 16,986 | 13.8 MiB |
-| Plus shared payloads and consolidated projections | 10,884 | 276,750 | 874 | 14,075 | 10.4 MiB |
+| Plus shared payloads and consolidated projections | 10,884 | 276,750 | 874 | 14,075 | 9.7 MiB |
 
 Write operations are successful calls on execution handles that affected at least
 one row, including parking, warm-up, replies and verification after engine launch.
@@ -296,7 +296,9 @@ measures payload bytes eliminated relative to materializing each reference; it
 excludes journals, indexes, digest keys and artifacts.
 
 SQLite kept up with 40 arrivals/s in all four trials. PostgreSQL still built a
-backlog at 3 arrivals/s: the final trial completed 1.19 runs/s with 14.09 s p95,
+backlog at 3 arrivals/s: the final trial completed 1.21 runs/s with 13.87 s p95,
 versus 1.26 runs/s with 14.16 s p95 at baseline. These single local trials show
 less write traffic; they do not establish a throughput improvement. Repeat with
 the intended workload and storage placement before choosing a batching limit.
+The final PostgreSQL result includes the advisory-lock fix that prevents
+receipt-only retries from generating WAL under synchronous replication.
