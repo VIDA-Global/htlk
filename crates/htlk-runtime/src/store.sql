@@ -25,16 +25,19 @@ CREATE TABLE journal (
     causation TEXT NOT NULL,
     command_id TEXT,
     payload BLOB NOT NULL,
+    pure_receipt INTEGER NOT NULL DEFAULT 0 CHECK(pure_receipt IN (0,1) AND (pure_receipt=0 OR (event_type='records_committed' AND command_id IS NOT NULL))),
     PRIMARY KEY(run_id,sequence)
 ) STRICT;
+CREATE UNIQUE INDEX journal_pure_receipts ON journal(run_id,command_id) WHERE pure_receipt=1;
 CREATE TABLE outbox (
     run_id TEXT NOT NULL,
     sequence INTEGER NOT NULL,
-    delivered INTEGER NOT NULL DEFAULT 0 CHECK(delivered IN (0,1)),
+    span INTEGER NOT NULL DEFAULT 1 CHECK(span BETWEEN 1 AND 8 AND sequence>=span),
+    pending INTEGER NOT NULL DEFAULT 1 CHECK(pending>=0 AND pending<(1 << span)),
     PRIMARY KEY(run_id,sequence),
     FOREIGN KEY(run_id,sequence) REFERENCES journal(run_id,sequence)
 ) STRICT;
-CREATE INDEX outbox_pending ON outbox(delivered,run_id,sequence);
+CREATE INDEX outbox_pending ON outbox(run_id,sequence) WHERE pending<>0;
 -- Each family retains its typed runtime record schema; these rows are not a
 -- second graph. Immutable/final records cannot be revised by normal transitions.
 CREATE TABLE checkpoint_payloads (

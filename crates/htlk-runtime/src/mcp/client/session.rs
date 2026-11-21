@@ -80,6 +80,9 @@ type SessionKey = (Digest, i64, Digest);
 #[derive(Default)]
 struct RegistryState {
     sessions: BTreeMap<SessionKey, SessionEntry>,
+    // Borrowable sessions may be evicted before their transports finish closing.
+    // Keep every started wire here until its bounded cleanup completes.
+    wires: Vec<Arc<Wire>>,
     // Bounded, non-evicting high-water marks outlive transport reclamation.
     generations: BTreeMap<Digest, i64>,
 }
@@ -119,7 +122,7 @@ pub struct NativeMcpClient {
     sender: mpsc::Sender<Command>,
     timeout_ms: u64,
     stop: Arc<McpCancellation>,
-    finished: tokio::sync::watch::Receiver<bool>,
+    finished: tokio::sync::watch::Receiver<Option<Result<(), FailureCode>>>,
     authentication: auth::AuthenticationMonitor,
 }
 impl NativeMcpClient {
@@ -150,7 +153,7 @@ impl NativeMcpClient {
         let stop = Arc::new(McpCancellation::new());
         let executors = workers::Executors::launch(&config, stop.clone())?;
         let owner_stop = stop.clone();
-        let (finished, completion) = tokio::sync::watch::channel(false);
+        let (finished, completion) = tokio::sync::watch::channel(None);
         std::thread::Builder::new().name("htlk-mcp-client".into()).spawn(move || {
             actix::System::new().block_on(async move {
                 let config = Arc::new(config);
@@ -211,15 +214,8 @@ impl NativeMcpClient {
                 }
                 receiver.close();
                 stop.cancel();
-                    let wires: Vec<_> = registry.lock().map(|entries| entries.sessions.values()
-                        .filter_map(|entry| entry.slot.get().and_then(|v| v.as_ref().ok()).cloned())
-                    .collect()).unwrap_or_default();
-                for wire in wires { jobs.spawn(async move { wire.close().await; }); }
-                let _ = tokio::time::timeout(Duration::from_secs(1), async {
-                    while jobs.join_next().await.is_some() {}
-                }).await;
-                jobs.abort_all();
-                finished.send_replace(true);
+                 let result = drain_shutdown(&registry, &mut jobs).await;
+                 finished.send_replace(Some(result));
             });
         }).map_err(|_| fail(FailureCode::McpTransport))?;
         Ok(Self {
@@ -278,11 +274,14 @@ impl NativeMcpClient {
     pub async fn shutdown(&self) -> Result<(), RuntimeFailure> {
         self.stop.cancel();
         let mut finished = self.finished.clone();
-        tokio::time::timeout(Duration::from_secs(2), finished.wait_for(|done| *done))
-            .await
-            .map_err(|_| fail(FailureCode::McpTimeout))?
-            .map(|_| ())
-            .map_err(|_| fail(FailureCode::McpTransport))
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), finished.wait_for(Option::is_some))
+                .await
+                .map_err(|_| fail(FailureCode::McpTimeout))?
+                .map_err(|_| fail(FailureCode::McpTransport))?;
+        result
+            .ok_or_else(|| fail(FailureCode::Invariant))?
+            .map_err(fail)
     }
     /// Watches protected credential failures and HTTP challenges, including those
     /// preventing initialization. Only the latest concern is retained; sequence
@@ -290,6 +289,25 @@ impl NativeMcpClient {
     pub fn authentication_concerns(&self) -> auth::McpAuthenticationConcerns {
         self.authentication.subscribe()
     }
+}
+
+async fn drain_shutdown(
+    registry: &Registry,
+    jobs: &mut tokio::task::JoinSet<()>,
+) -> Result<(), FailureCode> {
+    let wires = std::mem::take(&mut registry.lock().map_err(|_| FailureCode::Invariant)?.wires);
+    for wire in wires {
+        jobs.spawn(async move { wire.close().await });
+    }
+    let result = tokio::time::timeout(Duration::from_millis(1500), async {
+        while jobs.join_next().await.is_some() {}
+    })
+    .await;
+    if result.is_err() {
+        jobs.abort_all();
+        return Err(FailureCode::McpTimeout);
+    }
+    Ok(())
 }
 impl Drop for NativeMcpClient {
     fn drop(&mut self) {
@@ -577,19 +595,32 @@ async fn open(
                 || epochs.fetch_add(1, Ordering::Relaxed),
                 |session| session.epoch,
             );
-            let started = Wire::start(
-                owner.clone(),
-                server,
-                epoch,
-                endpoint,
-                config.clone(),
-                limits,
-                token.clone(),
-                stored_session.clone(),
-                executors,
-                dispatcher,
-            )
-            .await;
+            let started = (|| {
+                let mut registry = registry.lock().map_err(|_| fail(FailureCode::Invariant))?;
+                // A shutdown can occur while the durable epoch is being opened.
+                // Start and register the wire without suspending after this check.
+                if token.is_cancelled() {
+                    return Err(fail(FailureCode::Cancelled));
+                }
+                registry.wires.retain(|wire| !*wire.closed.borrow());
+                if registry.wires.len() >= config.limits.pending_requests {
+                    return Err(fail(FailureCode::McpTransport));
+                }
+                let wire = Wire::start(
+                    owner.clone(),
+                    server,
+                    epoch,
+                    endpoint,
+                    config.clone(),
+                    limits,
+                    token.clone(),
+                    stored_session.clone(),
+                    executors,
+                    dispatcher,
+                )?;
+                registry.wires.push(wire.clone());
+                Ok(wire)
+            })();
             let wire = match started {
                 Ok(wire) => wire,
                 Err(error) => {
@@ -605,6 +636,16 @@ async fn open(
                     return Err(error);
                 }
             };
+            let cleanup_registry = registry.clone();
+            let tracked = wire.clone();
+            tokio::spawn(async move {
+                let mut closed = tracked.closed.subscribe();
+                if closed.wait_for(|done| *done).await.is_ok()
+                    && let Ok(mut registry) = cleanup_registry.lock()
+                {
+                    registry.wires.retain(|wire| !Arc::ptr_eq(wire, &tracked));
+                }
+            });
             match wire.initialize().await {
                 Ok(()) => Ok(wire),
                 Err(error) => {

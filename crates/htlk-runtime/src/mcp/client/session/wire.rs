@@ -1,5 +1,9 @@
 //! Continuously receiving native transports with bounded pending correlation.
 use super::*;
+
+#[cfg(test)]
+#[path = "wire/shutdown_tests.rs"]
+mod shutdown_tests;
 use crate::mcp::{as_map, as_text, get};
 use htlk_executable::McpTransport;
 use std::{
@@ -220,7 +224,7 @@ impl Wire {
         &self.config.limits
     }
     #[allow(clippy::too_many_arguments)]
-    pub async fn start(
+    pub fn start(
         owner: McpOwner,
         server: ServerIdentity,
         epoch: u64,

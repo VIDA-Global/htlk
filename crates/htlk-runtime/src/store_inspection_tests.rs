@@ -1,5 +1,10 @@
 use super::*;
 
+#[cfg(feature = "postgres")]
+#[path = "../tests/support/commit_proxy.rs"]
+#[allow(dead_code)]
+mod commit_proxy;
+
 fn seed(name: &str) -> RunSeed {
     let limits = Limits::default();
     let run_id = RunId::new(name.into(), &limits).unwrap();
@@ -380,8 +385,11 @@ async fn batch_abort_contract(store: &Store) {
         store.inspection_record(&after, &key).await.unwrap().payload,
         Value::Integer(2)
     );
-    let counts = store.connection.read(move |db| db.query_row("SELECT (SELECT count(*) FROM inspection_record_keys WHERE run_id=?1),(SELECT count(*) FROM inspection_records v JOIN inspection_record_keys k USING(record_number) WHERE k.run_id=?1)", [run.run_id.as_str()], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))).await.unwrap();
+    let counts = store.connection.read(move |db| db.query_row("SELECT (SELECT count(*) FROM inspection_record_keys WHERE run_id=?1),(SELECT count(*) FROM inspection_changes v JOIN inspection_record_keys k USING(record_number) WHERE k.run_id=?1)", [run.run_id.as_str()], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))).await.unwrap();
     assert_eq!(counts, (1, 1));
+    let run = lease.run_id().clone();
+    let receipt_rows = store.connection.read(move |db| db.query_row("SELECT (SELECT count(*) FROM commands WHERE run_id=?1),(SELECT count(*) FROM journal WHERE pure_receipt=1 AND run_id=?1)", [run.as_str()], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))).await.unwrap();
+    assert_eq!(receipt_rows, (0, 2));
     assert_eq!(
         store.commit(&lease, first()).await.unwrap().sequence,
         seq + 1
@@ -408,6 +416,26 @@ async fn batch_abort_contract(store: &Store) {
             .collect::<Vec<_>>(),
         [seq + 1, seq + 2]
     );
+    let run = lease.run_id().clone();
+    assert_eq!(
+        store
+            .connection
+            .read(move |db| db.query_row(
+                "SELECT count(*) FROM outbox WHERE run_id=?1 AND span=2 AND pending=3",
+                [run.as_str()],
+                |row| row.get::<_, i64>(0)
+            ))
+            .await
+            .unwrap(),
+        1
+    );
+    for notice in pending {
+        store.acknowledge(&notice).await.unwrap();
+    }
+    assert_eq!(
+        store.pending_outbox(1).await.unwrap(),
+        vec![notices[0].clone()]
+    );
     store.acknowledge(&notices[1]).await.unwrap();
     store.acknowledge(&notices[1]).await.unwrap();
     assert!(
@@ -428,6 +456,12 @@ async fn batch_abort_contract(store: &Store) {
         store.inspection_position().await.unwrap(),
         *after.position()
     );
+    store.acknowledge(&notices[0]).await.unwrap();
+    store.acknowledge(&notices[1]).await.unwrap();
+    assert!(store.pending_outbox(100).await.unwrap().is_empty());
+    let mut unknown = notices[1].clone();
+    unknown.sequence += 1;
+    assert_eq!(store.acknowledge(&unknown).await, Err(StoreError::Missing));
 }
 
 #[cfg(feature = "sqlite")]
@@ -737,7 +771,7 @@ fn sqlite_projection_failure_and_uncommitted_writes_publish_no_boundary() {
         release_tx.send(()).unwrap();
         pending.await.unwrap();
         assert_eq!(reader.inspection_position().await.unwrap(),*before.position());
-        store.connection.call(|db| db.execute_batch("CREATE TRIGGER reject_projection BEFORE INSERT ON inspection_records BEGIN SELECT RAISE(ABORT,'injected'); END")).await.unwrap();
+        store.connection.call(|db| db.execute_batch("CREATE TRIGGER reject_projection BEFORE INSERT ON inspection_changes WHEN new.record_number IS NOT NULL BEGIN SELECT RAISE(ABORT,'injected'); END")).await.unwrap();
         let lease=store.acquire(&run.run_id,"replacement".into(),100,200).await.unwrap();
         let failed_before=reader.inspection_position().await.unwrap();
         assert_eq!(store.commit(&lease,transition("failed",vec![write("a",None,1)],101)).await,Err(StoreError::Database));
@@ -844,16 +878,33 @@ fn postgres_historical_storage_contract() {
         let store=PostgresStore::initialize(settings.clone(),StoreConfig::default()).await.unwrap();
         frozen_contract(&store).await;
         batch_abort_contract(&store).await;
+        let uncertain_run = seed("pure-commit-unknown");
+        store.create_run(uncertain_run.clone()).await.unwrap();
+        let lease = store.acquire(&uncertain_run.run_id,"owner".into(),20,100).await.unwrap();
+        let seq = store.run_header(&uncertain_run.run_id).await.unwrap().sequence;
+        let proxy = commit_proxy::CommitProxy::start();
+        let mut proxied = PostgresConfig::new(proxy.connection());
+        proxied.schema.clone_from(&settings.schema);
+        let uncertain = PostgresStore::open(proxied, StoreConfig::default()).await.unwrap();
+        let first = || transition("lost-first",vec![write("value",None,1)],21);
+        let second = || transition("lost-second",vec![write("value",Some(1),2)],21);
+        proxy.arm();
+        assert_eq!(uncertain.commit_pure_batch(&lease,seq,21,80,vec![first(),second()],vec![]).await,Err(StoreError::CommitUnknown));
+        assert!(proxy.observed_commit());
+        uncertain.close().await.unwrap();
+        assert_eq!(store.commit(&lease,first()).await.unwrap().sequence,seq+1);
+        assert_eq!(store.commit(&lease,second()).await.unwrap().sequence,seq+2);
+        assert_eq!(store.journal(&uncertain_run.run_id,seq,10).await.unwrap().len(),2);
         let run=seed("rollback");
         store.create_run(run.clone()).await.unwrap();
         let lease=store.acquire(&run.run_id,"owner".into(),0,100).await.unwrap();
         let original=store.open_inspection_snapshot(&run.run_id,None).await.unwrap();
-        store.connection.call(|db| db.execute_batch("CREATE FUNCTION reject_inspection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected projection failure'; END $$; CREATE TRIGGER reject_projection BEFORE INSERT ON inspection_records FOR EACH ROW EXECUTE FUNCTION reject_inspection()")).await.unwrap();
+        store.connection.call(|db| db.execute_batch("CREATE FUNCTION reject_inspection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected projection failure'; END $$; CREATE TRIGGER reject_projection BEFORE INSERT ON inspection_changes FOR EACH ROW WHEN (new.record_number IS NOT NULL) EXECUTE FUNCTION reject_inspection()")).await.unwrap();
         assert_eq!(store.commit(&lease,transition("failed",vec![write("a",None,1)],1)).await,Err(StoreError::Database));
         assert_eq!(store.open_inspection_snapshot(&run.run_id,None).await.unwrap(),original);
         assert_eq!(store.inspection_position().await.unwrap(),*original.position());
         assert_eq!(store.record(&run.run_id,&write("a",None,0).key).await,Err(StoreError::Missing));
-        store.connection.call(|db| db.execute_batch("DROP TRIGGER reject_projection ON inspection_records; DROP FUNCTION reject_inspection()")).await.unwrap();
+        store.connection.call(|db| db.execute_batch("DROP TRIGGER reject_projection ON inspection_changes; DROP FUNCTION reject_inspection()")).await.unwrap();
         let prior=store.inspection_position().await.unwrap();
         let batch_lease=lease.clone();
         store.connection.call(move |db| -> Result<(),StoreError> {

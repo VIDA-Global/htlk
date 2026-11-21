@@ -22,6 +22,13 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ### Changed
 
+- Pure batch command receipts are looked up by exact command identity in the
+  journal without maintaining a duplicate receipt row.
+- Historical record versions share their rows with inspection feed changes.
+  Point-in-time reads and independently resumable feeds retain their semantics.
+- Pure batches store outbox notices as bounded sequence ranges with independent
+  acknowledgments. The compact layouts require a fresh SQLite layout 20 or
+  PostgreSQL layout 7 store; older layouts are rejected without alteration.
 - Pure decision batches update the run sequence once and insert command receipts
   and outbox notices together while retaining one receipt and notice per decision.
 - Inspection publication reuses existing run and record ordinals without
@@ -63,6 +70,8 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ### Fixed
 
+- MCP client shutdown waits for bounded transport cleanup even when a cancelled
+  session has already been removed from the session lookup registry.
 - The interactive guide retries transient inspection conflicts while waiting for
   a run to finish or open a request, instead of failing an otherwise valid lesson.
 - PostgreSQL COMMIT warnings, including cancellation of a synchronous replication

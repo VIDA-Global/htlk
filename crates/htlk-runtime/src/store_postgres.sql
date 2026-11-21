@@ -1,4 +1,4 @@
--- Native PostgreSQL layout 4. Canonical CBOR remains authoritative.
+-- Native PostgreSQL layout 7. Canonical CBOR remains authoritative.
 -- Arbitrary UTF-8 identities are BYTEA (including NUL). Generated SHA-256 keys
 -- bound B-tree entries without narrowing admitted identity sizes. The preimage
 -- registry rejects collisions before any ON CONFLICT operation can conflate keys.
@@ -72,21 +72,24 @@ CREATE TABLE journal (
     causation BYTEA NOT NULL,
     command_id BYTEA,
     payload BYTEA NOT NULL,
+    pure_receipt BIGINT NOT NULL DEFAULT 0 CHECK(pure_receipt IN (0,1) AND (pure_receipt=0 OR (event_type='records_committed' AND command_id IS NOT NULL))),
     PRIMARY KEY(run_key,sequence)
 );
+CREATE UNIQUE INDEX journal_pure_receipts ON journal(run_key,sha256(command_id)) WHERE pure_receipt=1;
 CREATE TRIGGER journal_keys BEFORE INSERT OR UPDATE OF run_id ON journal
     FOR EACH ROW EXECUTE FUNCTION htlk_check_keys('run_id');
 CREATE TABLE outbox (
     run_id BYTEA NOT NULL,
     run_key BYTEA GENERATED ALWAYS AS (sha256(run_id)) STORED,
     sequence BIGINT NOT NULL,
-    delivered BIGINT NOT NULL DEFAULT 0 CHECK(delivered IN (0,1)),
+    span BIGINT NOT NULL DEFAULT 1 CHECK(span BETWEEN 1 AND 8 AND sequence>=span),
+    pending BIGINT NOT NULL DEFAULT 1 CHECK(pending>=0 AND pending<(1 << span::integer)),
     PRIMARY KEY(run_key,sequence),
     FOREIGN KEY(run_key,sequence) REFERENCES journal(run_key,sequence)
 );
 CREATE TRIGGER outbox_keys BEFORE INSERT OR UPDATE OF run_id ON outbox
     FOR EACH ROW EXECUTE FUNCTION htlk_check_keys('run_id');
-CREATE INDEX outbox_pending ON outbox(delivered,run_key,sequence);
+CREATE INDEX outbox_pending ON outbox(run_key,sequence) WHERE pending<>0;
 CREATE TABLE checkpoint_payloads (payload_digest TEXT PRIMARY KEY, payload BYTEA NOT NULL);
 CREATE TABLE record_heads (
     run_id BYTEA NOT NULL,
@@ -146,22 +149,19 @@ CREATE TABLE inspection_record_keys (
     UNIQUE(run_key,family,record_key)
 );
 CREATE INDEX inspection_record_page ON inspection_record_keys(run_key,family,record_number);
-CREATE TABLE inspection_records (
-    record_number BIGINT NOT NULL REFERENCES inspection_record_keys(record_number),
-    position BIGINT NOT NULL,
-    revision BIGINT NOT NULL,
-    final BIGINT NOT NULL,
-    payload_digest TEXT NOT NULL REFERENCES checkpoint_payloads(payload_digest),
-    PRIMARY KEY(record_number,position)
-);
 CREATE TABLE inspection_changes (
     change_id BIGSERIAL PRIMARY KEY,
     position BIGINT NOT NULL,
     run_number BIGINT NOT NULL REFERENCES inspection_runs(run_number),
-    record_number BIGINT NOT NULL CHECK(record_number>=0),
+    record_number BIGINT REFERENCES inspection_record_keys(record_number),
     sequence BIGINT NOT NULL,
-    UNIQUE(position,run_number,record_number)
+    revision BIGINT,
+    final BIGINT,
+    payload_digest TEXT REFERENCES checkpoint_payloads(payload_digest),
+    CHECK((record_number IS NULL AND revision IS NULL AND final IS NULL AND payload_digest IS NULL)
+       OR (record_number IS NOT NULL AND revision IS NOT NULL AND revision>=1 AND final IS NOT NULL AND final IN (0,1) AND payload_digest IS NOT NULL))
 );
+CREATE UNIQUE INDEX inspection_record_versions ON inspection_changes(record_number,position) WHERE record_number IS NOT NULL;
 CREATE UNIQUE INDEX accepted_artifact_identity ON record_heads(record_key) WHERE family='artifact';
 CREATE INDEX records_by_identity ON record_heads(family,record_key);
 CREATE VIEW records AS

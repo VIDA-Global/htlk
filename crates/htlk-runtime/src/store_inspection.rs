@@ -142,7 +142,7 @@ impl Store {
     /// Returns a storage failure or a count outside the supported integer range.
     pub async fn checkpoint_payload_bytes(&self) -> Result<(u64, u64), StoreError> {
         self.connection.read(|db| {
-            Ok(db.query_row("SELECT (SELECT coalesce(sum(length(payload)),0) FROM checkpoint_payloads),(SELECT coalesce(sum(length(p.payload)),0) FROM record_heads h JOIN checkpoint_payloads p USING(payload_digest))+(SELECT coalesce(sum(length(p.payload)),0) FROM inspection_records v JOIN checkpoint_payloads p USING(payload_digest))", [], |row| Ok((row.get(0)?, row.get(1)?)))?)
+            Ok(db.query_row("SELECT (SELECT coalesce(sum(length(payload)),0) FROM checkpoint_payloads),(SELECT coalesce(sum(length(p.payload)),0) FROM record_heads h JOIN checkpoint_payloads p USING(payload_digest))+(SELECT coalesce(sum(length(p.payload)),0) FROM inspection_changes v JOIN checkpoint_payloads p USING(payload_digest))", [], |row| Ok((row.get(0)?, row.get(1)?)))?)
         }).await.map_err(StoreError::from_worker)
     }
     /// Resolve one accepted artifact's original producing run at a committed pin.
@@ -531,7 +531,7 @@ fn historical_record(
     position: i64,
     limits: &Limits,
 ) -> Result<StoredRecord, StoreError> {
-    let (revision,final_record,raw) = db.query_row("SELECT v.revision,v.final,p.payload FROM inspection_records v LEFT JOIN checkpoint_payloads p USING(payload_digest) WHERE v.record_number=?1 AND v.position<=?2 ORDER BY v.position DESC LIMIT 1",params![number,position],|row| Ok((row.get::<_,i64>(0)?,row.get::<_,bool>(1)?,row.get::<_,Vec<u8>>(2)?)))?;
+    let (revision,final_record,raw) = db.query_row("SELECT v.revision,v.final,p.payload FROM inspection_changes v LEFT JOIN checkpoint_payloads p USING(payload_digest) WHERE v.record_number=?1 AND v.position<=?2 ORDER BY v.position DESC LIMIT 1",params![number,position],|row| Ok((row.get::<_,i64>(0)?,row.get::<_,bool>(1)?,row.get::<_,Vec<u8>>(2)?)))?;
     if number < 1 || revision < 1 {
         return Err(StoreError::Corrupt);
     }
@@ -731,7 +731,10 @@ pub(crate) fn flush_projection(db: &rusqlite::Connection) -> rusqlite::Result<()
                 r.get(0)
             })?;
         db.execute("INSERT INTO inspection_headers(run_number,position,fingerprint,root_scope,status,sequence,owner,fence,lease_expires_ms,last_time_ms) SELECT ?1,?2,fingerprint,root_scope,status,sequence,owner,fence,lease_expires_ms,last_time_ms FROM runs WHERE run_id=?3",params![run_number,position,run])?;
-        db.execute("INSERT INTO inspection_changes(position,run_number,record_number,sequence) VALUES(?1,?2,0,?3)",params![position,run_number,sequence])?;
+        db.execute(
+            "INSERT INTO inspection_changes(position,run_number,sequence) VALUES(?1,?2,?3)",
+            params![position, run_number, sequence],
+        )?;
         for RecordKey { family, id } in keys {
             let family = family.as_str();
             let existing = db.query_row("SELECT record_number FROM inspection_record_keys WHERE run_id=?1 AND family=?2 AND record_id=?3",params![run,family,id],|r| r.get::<_, i64>(0)).optional()?;
@@ -742,11 +745,10 @@ pub(crate) fn flush_projection(db: &rusqlite::Connection) -> rusqlite::Result<()
                     db.last_insert_rowid()
                 }
             };
-            let copied = db.execute("INSERT INTO inspection_records(record_number,position,revision,final,payload_digest) SELECT ?1,?2,revision,final,payload_digest FROM record_heads WHERE run_id=?3 AND family=?4 AND record_id=?5",params![record_number,position,run,family,id])?;
+            let copied = db.execute("INSERT INTO inspection_changes(record_number,position,run_number,sequence,revision,final,payload_digest) SELECT ?1,?2,?3,?4,revision,final,payload_digest FROM record_heads WHERE run_id=?5 AND family=?6 AND record_id=?7",params![record_number,position,run_number,sequence,run,family,id])?;
             if copied != 1 {
                 return Err(rusqlite::Error::Database);
             }
-            db.execute("INSERT INTO inspection_changes(position,run_number,record_number,sequence) VALUES(?1,?2,?3,?4)",params![position,run_number,record_number,sequence])?;
         }
     }
     db.execute("INSERT INTO inspection_commits(position,run_upper,record_upper,change_upper) VALUES(?1,(SELECT coalesce(max(run_number),0) FROM inspection_runs),(SELECT coalesce(max(record_number),0) FROM inspection_record_keys),(SELECT coalesce(max(change_id),0) FROM inspection_changes))",[position])?;
