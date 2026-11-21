@@ -54,6 +54,12 @@ wait or artifact IDs when routing by those IDs alone. `positions()` returns one
 history pin per store for paged reads, without a global commit order or a
 transaction spanning partitions.
 
+Execution engines discover runnable work on local admission and host-command hints,
+at known eligibility times, and through bounded reconciliation for work written
+by independent processes. With the default configuration, idle discovery checks
+for otherwise unannounced work every 250 ms. Deadline checks and lease renewal
+can run while execution workers are busy.
+
 Set `ExecutionConfig::pure_batch_steps` to 2–8 to combine ready guard, admission,
 skip, and pure `eval` decisions within a scope into bounded commits. The default
 is 1. Each logical decision remains in the journal; inspection pins represent

@@ -349,3 +349,29 @@ PostgreSQL replay took 47% longer in this single pair. These runs had no drainin
 outbox consumer; they measure write volume for one workflow and do not establish
 a throughput improvement, the cause of the elapsed-time difference, or behavior
 under concurrent load.
+
+## Scheduler and artifact transaction campaign
+
+Three release trials per case compared `a421dce` (control) with `beeb3ff` on
+the M4 Max host and a dedicated PostgreSQL 18.6 Docker container. Both builds
+used the default batching setting and local commit durability, with identical
+arrivals, readers, and warm-up. The table reports medians of the three trials.
+Throughput counts all completed runs over the measured window; backlog is
+measured at the end of the offer.
+
+| Backend and workload | Completed runs/s | Completion p95 | End backlog | Successful write operations |
+| --- | ---: | ---: | ---: | ---: |
+| SQLite, 75/s fixed rate | 75.03 → 74.95 | 16.58 → 16.69 ms | 1 → 1 | 4,225 → 3,842 |
+| SQLite, 40/s mixed | 39.91 → 39.94 | 82.58 → 77.20 ms | 2 → 2 | 20,634 → 19,857 |
+| PostgreSQL, 2/s fixed rate | 2.04 → 2.06 | 319.82 → 193.36 ms | 1 → 1 | 309 → 281 |
+| PostgreSQL, 3/s mixed | 1.32 → 2.96 | 12.80 → 1.14 s | 14 → 2 | 1,112 → 1,031 |
+
+PostgreSQL mixed trials fell from 25,245 to 8,406 commits (67%) and from
+145,667 to 84,697 statement calls (42%) per process window, with all 24 offered
+runs completing in every trial. WAL moved from 9.74 to 9.33 MiB. The five-second
+empty-engine probe count went from 250 to 20 (92%) in sampled trials; SQLite
+uses the same supervisor and its exact probe count was not collected. The
+mixed parked-reply p95 moved from 254 to 188 ms on PostgreSQL and from 15.0 to
+16.0 ms on SQLite. Counters include setup, parked runs, and verification;
+PostgreSQL statement/commit counts also include readers. They measure workload
+cost, not an isolated scheduler/control call count or a production capacity limit.
