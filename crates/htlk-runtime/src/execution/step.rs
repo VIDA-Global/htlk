@@ -338,6 +338,17 @@ pub(super) async fn commit(
     writes: Vec<RecordWrite>,
     status: Option<RunStatus>,
 ) -> Result<(), RuntimeError> {
+    commit_with_blobs(runtime, lease, command, writes, status, Vec::new()).await
+}
+
+async fn commit_with_blobs(
+    runtime: &Runtime,
+    lease: &RunLease,
+    command: String,
+    writes: Vec<RecordWrite>,
+    status: Option<RunStatus>,
+    blobs: Vec<PreparedArtifact>,
+) -> Result<(), RuntimeError> {
     let now = runtime.clock.now_ms()?;
     let transition = Transition {
         context: TransitionContext {
@@ -352,10 +363,15 @@ pub(super) async fn commit(
         expected_fingerprint: None,
     };
     if PURE_DRAFT.try_with(|_| ()).is_ok() {
-        return PURE_DRAFT
-            .with(|draft| draft.borrow_mut().push(transition, &runtime.config.limits));
+        return PURE_DRAFT.with(|draft| {
+            let mut draft = draft.borrow_mut();
+            for blob in blobs {
+                draft.stage(blob)?;
+            }
+            draft.push(transition, &runtime.config.limits)
+        });
     }
-    commit_one(runtime, lease, transition).await
+    commit_one(runtime, lease, transition, blobs).await
 }
 
 #[derive(Default)]
@@ -508,6 +524,7 @@ async fn commit_one(
     runtime: &Runtime,
     lease: &RunLease,
     transition: Transition,
+    blobs: Vec<PreparedArtifact>,
 ) -> Result<(), RuntimeError> {
     let retained = working::with(|_| {
         transition
@@ -526,7 +543,7 @@ async fn commit_one(
     let hint = super::control::earliest(&transition.writes);
     let receipt = runtime
         .store
-        .commit_at_sequence(lease, transition, sequence)
+        .commit_with_artifacts(lease, transition, sequence, blobs)
         .await?;
     if let Some(retained) = retained {
         working::with(|set| {
@@ -1548,6 +1565,7 @@ pub(super) async fn accept_node(
     // Rebuild after the contract to include all additional control influence.
     let mut writes = Vec::new();
     let mut final_outputs = Vec::new();
+    let mut blobs = Vec::with_capacity(artifacts.len());
     for artifact in artifacts {
         let metadata = artifact.metadata();
         let value = metadata.verify_value(artifact.bytes(), &runtime.config.limits)?;
@@ -1577,11 +1595,7 @@ pub(super) async fn accept_node(
             artifact.metadata().to_value(&runtime.config.limits)?,
             true,
         ));
-        if PURE_DRAFT.try_with(|_| ()).is_ok() {
-            PURE_DRAFT.with(|draft| draft.borrow_mut().stage(artifact))?;
-        } else {
-            runtime.store.stage_artifact(&artifact).await?;
-        }
+        blobs.push(artifact);
     }
     for (port, value) in outputs {
         if entry(&value)?.is_none() {
@@ -1608,12 +1622,13 @@ pub(super) async fn accept_node(
         return finish_failure(runtime, lease, record, FailureCode::Timeout, influence).await;
     }
     writes.push(update(record, payload, true));
-    commit(
+    commit_with_blobs(
         runtime,
         lease,
         format!("succeed:{}:{}", record.key.id, record.revision),
         writes,
         None,
+        blobs,
     )
     .await
 }

@@ -26,6 +26,8 @@ User-visible changes and compatibility boundaries are recorded here, following
   bounded reconciliation on both database backends. Native identities change.
 - Active execution uses independent deadline and lease timers, reuses deadline
   observations at the same committed sequence, and batches cold checkpoint reads.
+- Run admission, node completion, and extension acceptance store new local artifact
+  bytes in the transaction that publishes their metadata.
 - Pure batch command receipts are looked up by exact command identity in the
   journal without maintaining a duplicate receipt row.
 - Historical record versions share their rows with inspection feed changes.

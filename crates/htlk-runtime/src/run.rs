@@ -434,9 +434,6 @@ impl Runtime {
             },
             Err(error) => Some(RuntimeFailure::new(error.code())),
         };
-        for artifact in &artifacts {
-            self.store.stage_artifact(artifact).await?;
-        }
         let prepared = PreparedRun {
             run_id,
             fingerprint,
