@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const APPLICATION_ID: &str = "htlk.runtime.postgres";
 const SCHEMA: &str = include_str!("store_postgres.sql");
 

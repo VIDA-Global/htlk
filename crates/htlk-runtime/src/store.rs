@@ -16,7 +16,7 @@ use htlk_executable::{
 };
 use std::{fmt, path::Path, time::Duration};
 
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
 const APPLICATION_ID: i64 = 0x48544c4b;
 const SCHEMA: &str = include_str!("store.sql");
 const REGISTRATION_SCHEMA: &str = include_str!("store_registration.sql");

@@ -24,9 +24,11 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 - Pure batch command receipts are looked up by exact command identity in the
   journal without maintaining a duplicate receipt row.
+- Historical record versions share their rows with inspection feed changes.
+  Point-in-time reads and independently resumable feeds retain their semantics.
 - Pure batches store outbox notices as bounded sequence ranges with independent
-  acknowledgments. The compact layouts require a fresh SQLite layout 19 or
-  PostgreSQL layout 6 store; older layouts are rejected without alteration.
+  acknowledgments. The compact layouts require a fresh SQLite layout 20 or
+  PostgreSQL layout 7 store; older layouts are rejected without alteration.
 - Pure decision batches update the run sequence once and insert command receipts
   and outbox notices together while retaining one receipt and notice per decision.
 - Inspection publication reuses existing run and record ordinals without

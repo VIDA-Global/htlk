@@ -7,7 +7,7 @@ records are not an additional supported wire format.
 
 ## Storage compatibility
 
-The SQLite application ID is `0x48544c4b`; the private schema version is **19**.
+The SQLite application ID is `0x48544c4b`; the private schema version is **20**.
 An empty database initializes in one immediate transaction. Versions 1–16, future
 versions, foreign application IDs, and nonempty unrecognized databases fail without
 relabeling or deletion. There is no automatic migration or legacy binding decoder.
@@ -63,7 +63,8 @@ does not acquire provider capabilities.
 ### Historical inspection projections
 
 `append_event` queues bounded record identities for `inspection_headers`,
-`inspection_records`, stable run/record ordinal catalogs and `inspection_changes`.
+stable run/record ordinal catalogs and `inspection_changes`. A record change
+also carries its pinned version; the feed projects only its metadata.
 The worker publishes those projections inside the authoritative transaction, once
 per physical commit. These read indexes are not a replacement recovery journal.
 They never contain artifact value blobs or become retention roots. Artifact producer
@@ -118,7 +119,7 @@ covers caller procedures.
 The optional `postgres` feature provides native PostgreSQL tables in a dedicated
 host-selected schema. `PostgresStore::initialize` transactionally creates an empty
 recognized layout; `PostgresStore::open` requires existing state. The metadata
-application is `htlk.runtime.postgres`, layout version **6**. Initialization and
+application is `htlk.runtime.postgres`, layout version **7**. Initialization and
 opening also compare the exact embedded layout digest; a matching version label
 cannot reinterpret a different private layout. Initialization and
 multi-domain operations use an exclusive database/schema-scoped transaction
