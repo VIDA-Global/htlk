@@ -154,19 +154,8 @@ async fn tick_observed(
             context,
             nodes: BTreeMap::new(),
         };
-        for node in &scope.definition.fields().nodes {
-            let invocation =
-                InvocationId::new(id, node.id(), &runtime.config.limits).map_err(|_| err())?;
-            match scheduling_record(&runtime, &lease, &key(RecordFamily::Invocation, invocation))
-                .await
-            {
-                Ok(record) => {
-                    scope.nodes.insert(node.id().clone(), record);
-                }
-                Err(StoreError::Missing) => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
+        scope.nodes =
+            scheduling_invocations(&runtime, &lease, id, &scope.definition.fields().nodes).await?;
         if due(&scope.record.payload, now)? {
             stop_scope(&runtime, &lease, &scope, FailureCode::Timeout).await?;
             return Ok(Progress::Changed);
@@ -349,6 +338,17 @@ pub(super) async fn commit(
     writes: Vec<RecordWrite>,
     status: Option<RunStatus>,
 ) -> Result<(), RuntimeError> {
+    commit_with_blobs(runtime, lease, command, writes, status, Vec::new()).await
+}
+
+async fn commit_with_blobs(
+    runtime: &Runtime,
+    lease: &RunLease,
+    command: String,
+    writes: Vec<RecordWrite>,
+    status: Option<RunStatus>,
+    blobs: Vec<PreparedArtifact>,
+) -> Result<(), RuntimeError> {
     let now = runtime.clock.now_ms()?;
     let transition = Transition {
         context: TransitionContext {
@@ -363,10 +363,15 @@ pub(super) async fn commit(
         expected_fingerprint: None,
     };
     if PURE_DRAFT.try_with(|_| ()).is_ok() {
-        return PURE_DRAFT
-            .with(|draft| draft.borrow_mut().push(transition, &runtime.config.limits));
+        return PURE_DRAFT.with(|draft| {
+            let mut draft = draft.borrow_mut();
+            for blob in blobs {
+                draft.stage(blob)?;
+            }
+            draft.push(transition, &runtime.config.limits)
+        });
     }
-    commit_one(runtime, lease, transition).await
+    commit_one(runtime, lease, transition, blobs).await
 }
 
 #[derive(Default)]
@@ -493,6 +498,11 @@ async fn batch_local(
             .ok_or_else(err)?,
     );
     let deadline = number(&scope.record.payload, "deadline_ms")?;
+    let hint = draft
+        .steps
+        .iter()
+        .filter_map(|step| super::control::earliest(&step.writes))
+        .min();
     runtime
         .store
         .commit_pure_batch(
@@ -504,6 +514,7 @@ async fn batch_local(
             draft.blobs,
         )
         .await?;
+    working::with(|set| set.note_deadline(hint));
     // Reload if another operation changed the run after the batch began. The
     // durable sequence is also checked by every later scheduling observation.
     Ok(Some(true))
@@ -513,6 +524,7 @@ async fn commit_one(
     runtime: &Runtime,
     lease: &RunLease,
     transition: Transition,
+    blobs: Vec<PreparedArtifact>,
 ) -> Result<(), RuntimeError> {
     let retained = working::with(|_| {
         transition
@@ -528,12 +540,16 @@ async fn commit_one(
             .collect::<Vec<_>>()
     });
     let sequence = working::with(|set| set.sequence).filter(|sequence| *sequence > 0);
+    let hint = super::control::earliest(&transition.writes);
     let receipt = runtime
         .store
-        .commit_at_sequence(lease, transition, sequence)
+        .commit_with_artifacts(lease, transition, sequence, blobs)
         .await?;
     if let Some(retained) = retained {
-        working::with(|set| set.committed(receipt.sequence, retained, &runtime.config.limits));
+        working::with(|set| {
+            set.committed(receipt.sequence, retained, &runtime.config.limits);
+            set.note_deadline(hint);
+        });
     }
     Ok(())
 }
@@ -552,6 +568,51 @@ async fn scheduling_record(
     let record = runtime.store.record(lease.run_id(), key).await?;
     working::with(|set| set.retain(record.clone(), &runtime.config.limits));
     Ok(record)
+}
+
+async fn scheduling_invocations(
+    runtime: &Runtime,
+    lease: &RunLease,
+    scope: ScopeInstanceId,
+    nodes: &[Node],
+) -> Result<BTreeMap<Identifier, StoredRecord>, RuntimeError> {
+    let mut records = BTreeMap::new();
+    for group in nodes.chunks(runtime.store.config().max_page_size.min(16)) {
+        let mut cold = BTreeMap::new();
+        for node in group {
+            let invocation =
+                InvocationId::new(scope, node.id(), &runtime.config.limits).map_err(|_| err())?;
+            let key = key(RecordFamily::Invocation, invocation);
+            if let Some(record) = working::with(|set| set.get(&key)).flatten() {
+                records.insert(node.id().clone(), record);
+            } else {
+                cold.insert(key.id, node.id());
+            }
+        }
+        if cold.len() > 1
+            && let Some(group) = runtime
+                .store
+                .invocation_group(lease.run_id(), cold.keys().cloned().collect())
+                .await?
+        {
+            for record in group {
+                let node = cold.remove(&record.key.id).ok_or_else(err)?;
+                working::with(|set| set.retain(record.clone(), &runtime.config.limits));
+                records.insert(node.clone(), record);
+            }
+            continue;
+        }
+        for (id, node) in cold {
+            match scheduling_record(runtime, lease, &key(RecordFamily::Invocation, id)).await {
+                Ok(record) => {
+                    records.insert(node.clone(), record);
+                }
+                Err(StoreError::Missing) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(records)
 }
 fn due(value: &Value, now: i64) -> Result<bool, RuntimeError> {
     Ok(matches!(map(value)?.get("deadline_ms"),Some(Value::Integer(deadline))if now>=*deadline))
@@ -1504,6 +1565,7 @@ pub(super) async fn accept_node(
     // Rebuild after the contract to include all additional control influence.
     let mut writes = Vec::new();
     let mut final_outputs = Vec::new();
+    let mut blobs = Vec::with_capacity(artifacts.len());
     for artifact in artifacts {
         let metadata = artifact.metadata();
         let value = metadata.verify_value(artifact.bytes(), &runtime.config.limits)?;
@@ -1533,11 +1595,7 @@ pub(super) async fn accept_node(
             artifact.metadata().to_value(&runtime.config.limits)?,
             true,
         ));
-        if PURE_DRAFT.try_with(|_| ()).is_ok() {
-            PURE_DRAFT.with(|draft| draft.borrow_mut().stage(artifact))?;
-        } else {
-            runtime.store.stage_artifact(&artifact).await?;
-        }
+        blobs.push(artifact);
     }
     for (port, value) in outputs {
         if entry(&value)?.is_none() {
@@ -1564,12 +1622,13 @@ pub(super) async fn accept_node(
         return finish_failure(runtime, lease, record, FailureCode::Timeout, influence).await;
     }
     writes.push(update(record, payload, true));
-    commit(
+    commit_with_blobs(
         runtime,
         lease,
         format!("succeed:{}:{}", record.key.id, record.revision),
         writes,
         None,
+        blobs,
     )
     .await
 }

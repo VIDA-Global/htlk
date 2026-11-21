@@ -55,6 +55,7 @@ pub use partitions::{PartitionPositions, StorePartitions};
 
 #[path = "store_execution.rs"]
 mod execution;
+pub(crate) use execution::{DeadlineObservation, DeadlineTarget};
 
 #[path = "store_runs.rs"]
 pub(crate) mod runs;
@@ -277,17 +278,17 @@ impl Store {
         now_ms: i64,
         expires_at_ms: i64,
     ) -> Result<RunLease, StoreError> {
-        self.acquire_candidate(run, owner, now_ms, expires_at_ms, false)
+        self.acquire_inner(run, owner, now_ms, expires_at_ms, Acquisition::Authority)
             .await
     }
 
-    pub(crate) async fn acquire_candidate(
+    pub(crate) async fn acquire_inner(
         &self,
         run: &RunId,
         owner: String,
         now_ms: i64,
         expires_at_ms: i64,
-        parked_only: bool,
+        acquisition: Acquisition,
     ) -> Result<RunLease, StoreError> {
         check_lease_times(now_ms, expires_at_ms)?;
         self.check_text(&owner)?;
@@ -297,7 +298,7 @@ impl Store {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let header = load_header(&tx, &run)?;
             if header.status.is_terminal() { return Err(StoreError::Terminal); }
-            if parked_only {
+            if acquisition == Acquisition::Parked {
                 let parked: bool = tx.query_row("SELECT owner IS NULL AND eligible_at_ms>0 FROM runs WHERE run_id=?1", [run.as_str()], |row| row.get(0))?;
                 if !parked { return Err(StoreError::Fenced); }
             }
@@ -306,7 +307,12 @@ impl Store {
             if header.owner.is_some() && header.expires_at_ms.is_some_and(|expiry| expiry > now) { return Err(StoreError::Fenced); }
             let fence = header.fence.checked_add(1).ok_or(StoreError::Invalid)?;
             let sequence = header.sequence.checked_add(1).ok_or(StoreError::Invalid)?;
-            tx.execute("UPDATE runs SET owner=?2,fence=?3,lease_expires_ms=?4,eligible_at_ms=?4,sequence=?5,last_time_ms=?6 WHERE run_id=?1", params![run.as_str(), owner, fence, expires_at_ms, sequence, now])?;
+            let updated = if acquisition == Acquisition::Due {
+                tx.execute("UPDATE runs SET owner=?2,fence=?3,lease_expires_ms=?4,eligible_at_ms=?4,sequence=?5,last_time_ms=?6 WHERE run_id=?1 AND eligible_at_ms<=?6", params![run.as_str(), owner, fence, expires_at_ms, sequence, now])?
+            } else {
+                tx.execute("UPDATE runs SET owner=?2,fence=?3,lease_expires_ms=?4,eligible_at_ms=?4,sequence=?5,last_time_ms=?6 WHERE run_id=?1", params![run.as_str(), owner, fence, expires_at_ms, sequence, now])?
+            };
+            if updated != 1 { return Err(StoreError::Fenced); }
             let payload = lease_payload(&owner, fence, expires_at_ms, &limits)?;
             append_event(&tx, run.as_str(), sequence, EventMeta { kind: "ownership_acquired", actor: &owner, timestamp: now, causation: "ownership", command: None }, &payload, &limits)?;
             tx.commit()?;
@@ -326,12 +332,39 @@ impl Store {
         expires_at_ms: i64,
     ) -> Result<(), StoreError> {
         check_lease_times(now_ms, expires_at_ms)?;
+        self.renew_inner(lease, now_ms, Renewal::Expiry(expires_at_ms))
+            .await
+    }
+
+    pub(crate) async fn renew_for(
+        &self,
+        lease: &RunLease,
+        observed: i64,
+        duration: i64,
+    ) -> Result<(), StoreError> {
+        timestamp(observed)?;
+        self.renew_inner(lease, observed, Renewal::Duration(duration))
+            .await
+    }
+
+    async fn renew_inner(
+        &self,
+        lease: &RunLease,
+        now_ms: i64,
+        renewal: Renewal,
+    ) -> Result<(), StoreError> {
         let limits = self.config.limits.clone();
         let lease = lease.clone();
         self.connection.write_run(lease.run_id().to_string(), move |db| -> Result<(), StoreError> {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let header = load_header(&tx, &lease.run_id)?;
-            let now = now_ms.max(header.last_time_ms);
+            let (now, expires_at_ms) = match renewal {
+                Renewal::Expiry(expiry) => (now_ms.max(header.last_time_ms), expiry),
+                Renewal::Duration(duration) => {
+                    let now = runs::observed_time(&tx, now_ms)?.max(header.last_time_ms);
+                    (now, now.saturating_add(duration))
+                }
+            };
             check_authority(&header, &lease, now)?;
             if header.status.is_terminal() { return Err(StoreError::Terminal); }
             if expires_at_ms <= now || header.expires_at_ms.is_some_and(|old| expires_at_ms < old) { return Err(StoreError::Invalid); }
@@ -359,6 +392,18 @@ impl Store {
             .text(text, 0)
             .map_err(|_| StoreError::Invalid)
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Acquisition {
+    Authority,
+    Due,
+    Parked,
+}
+
+enum Renewal {
+    Expiry(i64),
+    Duration(i64),
 }
 
 /// Validated run identity and graph selected by the calling runtime service.

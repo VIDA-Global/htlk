@@ -123,7 +123,47 @@ impl SqliteStore {
     }
 }
 
-pub(super) fn stage_bytes(
+/// Verify proposals before admitting database work. All accepting writers take
+/// shared content-address locks in digest order.
+pub(super) fn prepare_blobs(
+    blobs: &mut [PreparedArtifact],
+    limits: &Limits,
+) -> Result<(), StoreError> {
+    for blob in &*blobs {
+        if blob.bytes().len() > limits.max_document_bytes {
+            return Err(StoreError::Invalid);
+        }
+        blob.metadata()
+            .verify_value(blob.bytes(), limits)
+            .map_err(artifact_error)?;
+    }
+    blobs.sort_unstable_by_key(|blob| blob.metadata().storage_reference());
+    Ok(())
+}
+
+pub(super) fn stage_blobs(
+    tx: &rusqlite::Transaction<'_>,
+    blobs: &[PreparedArtifact],
+) -> Result<(), StoreError> {
+    let mut previous = None;
+    for blob in blobs {
+        let reference = blob.metadata().storage_reference();
+        let bytes = blob.bytes();
+        if let Some((digest, old)) = previous
+            && digest == reference
+        {
+            if old != bytes {
+                return Err(StoreError::Corrupt);
+            }
+            continue;
+        }
+        stage_bytes(tx, reference, bytes)?;
+        previous = Some((reference, bytes));
+    }
+    Ok(())
+}
+
+fn stage_bytes(
     tx: &rusqlite::Transaction<'_>,
     reference: Digest,
     bytes: &[u8],
@@ -389,6 +429,11 @@ mod tests {
     use std::sync::Arc;
 
     async fn setup() -> (SqliteStore, PreparedArtifact, RunLease) {
+        let (store, [artifact], lease) = setup_many().await;
+        (store, artifact, lease)
+    }
+
+    async fn setup_many<const N: usize>() -> (SqliteStore, [PreparedArtifact; N], RunLease) {
         let (admitted, bytes) = registration::tests::executable();
         let l = Limits::default();
         let store = SqliteStore::in_memory(StoreConfig::default())
@@ -411,24 +456,26 @@ mod tests {
             .await
             .unwrap();
         let lease = store.acquire(&run, "owner".into(), 0, 100).await.unwrap();
-        let artifact = PreparedArtifact::new(
-            &admitted,
-            ArtifactInput {
-                producer: ArtifactProducer::RunInput {
-                    run_id: run,
-                    extension_number: 0,
-                    port: "seed".parse().unwrap(),
+        let artifacts = std::array::from_fn(|_| {
+            PreparedArtifact::new(
+                &admitted,
+                ArtifactInput {
+                    producer: ArtifactProducer::RunInput {
+                        run_id: run.clone(),
+                        extension_number: 0,
+                        port: "seed".parse().unwrap(),
+                    },
+                    value_type: &ValueType::builtin(BuiltinType::String),
+                    value: &Value::Text("protected".into()),
+                    input_artifact_ids: vec![],
+                    security_labels: SecurityLabels::new(vec!["protected".into()], &l).unwrap(),
+                    accepted_at: 1,
                 },
-                value_type: &ValueType::builtin(BuiltinType::String),
-                value: &Value::Text("protected".into()),
-                input_artifact_ids: vec![],
-                security_labels: SecurityLabels::new(vec!["protected".into()], &l).unwrap(),
-                accepted_at: 1,
-            },
-            &l,
-        )
-        .unwrap();
-        (store, artifact, lease)
+                &l,
+            )
+            .unwrap()
+        });
+        (store, artifacts, lease)
     }
     fn write(artifact: &PreparedArtifact) -> RecordWrite {
         RecordWrite {
@@ -454,6 +501,64 @@ mod tests {
             root: None,
             expected_fingerprint: None,
         }
+    }
+
+    #[actix::test]
+    async fn accepting_transaction_rolls_back_blob_with_failed_publication() {
+        let (store, [artifact, retry, duplicate], lease) = setup_many().await;
+        let before = store.run_header(lease.run_id()).await.unwrap();
+        let position = store.inspection_position().await.unwrap();
+        let artifact_id = artifact.metadata().artifact_id();
+        let reference = artifact.metadata().storage_reference();
+        store.connection.call::<_, StoreError>(|db| {
+            db.execute_batch("CREATE TRIGGER reject_artifact_outbox BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT,'injected publication failure'); END")?;
+            Ok(())
+        }).await.unwrap();
+        let decision = || transition("accept-blob", vec![write(&duplicate)]);
+        assert!(
+            store
+                .commit_with_artifacts(&lease, decision(), None, vec![artifact])
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            store.artifact_metadata(artifact_id).await,
+            Err(StoreError::Missing)
+        ));
+        assert!(matches!(
+            store
+                .artifact_bytes_limited(artifact_id, reference, 1024)
+                .await,
+            Err(StoreError::Missing)
+        ));
+        assert_eq!(store.run_header(lease.run_id()).await.unwrap(), before);
+        assert_eq!(store.inspection_position().await.unwrap(), position);
+        store
+            .connection
+            .call::<_, StoreError>(|db| {
+                db.execute_batch("DROP TRIGGER reject_artifact_outbox")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let receipt = store
+            .commit_with_artifacts(&lease, decision(), None, vec![retry])
+            .await
+            .unwrap();
+        let writes = store.write_metrics();
+        let expected = duplicate.bytes().to_vec();
+        assert_eq!(
+            store
+                .commit_with_artifacts(&lease, decision(), None, vec![duplicate])
+                .await
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(store.write_metrics(), writes);
+        assert_eq!(
+            store.artifact_bytes(artifact_id, reference).await.unwrap(),
+            expected
+        );
     }
     #[test]
     fn metadata_requires_staged_bytes_and_is_immutable_after_atomic_publication() {

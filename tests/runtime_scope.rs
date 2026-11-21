@@ -355,6 +355,66 @@ async fn empty_scope_and_selected_execution_leave_ready_and_overdue_runs_unchang
 }
 
 #[actix::test]
+async fn idle_engine_reconciles_admission_through_an_independent_store_handle() {
+    let path = std::env::temp_dir().join(format!(
+        "htlk-scope-remote-{}-{}.sqlite",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let coordinator = SqliteStore::open(&path, StoreConfig::default())
+        .await
+        .unwrap();
+    let admission = SqliteStore::open(&path, StoreConfig::default())
+        .await
+        .unwrap();
+    let (compiler, registry) = support::native_compiler_with_timeouts(60_000, 1000);
+    let graph = compiler.compile_source(
+        r#"ir_version="0.1" graph scope.remote {inputs={} outputs={value=boolean}
+            nodes{result=eval(boolean,true)} edges{edge result{from=result.outputs.value to=outputs.value}}}"#,
+        &support::catalogs(),
+    ).unwrap();
+    let registry = Arc::new(registry);
+    let runtime = |store: SqliteStore| {
+        Arc::new(
+            Runtime::new(
+                store,
+                registry.clone(),
+                Arc::new(Policy {
+                    deny_dispatch: AtomicBool::new(false),
+                }),
+                RuntimeConfig::default(),
+            )
+            .unwrap(),
+        )
+    };
+    let worker = runtime(coordinator.clone());
+    let host = runtime(admission.clone());
+    host.register_graph(&caller(), &graph.executable_bytes, &[])
+        .await
+        .unwrap();
+    let engine = ExecutionEngine::launch(worker.clone(), ExecutionConfig::default()).unwrap();
+    for name in ["remote-first", "remote-after-idle"] {
+        let run = host
+            .start_run(&caller(), graph.fingerprint, &BTreeMap::new(), name, None)
+            .await
+            .unwrap()
+            .run_id;
+        assert_eq!(
+            terminal(&worker, &run).await.header.status,
+            RunStatus::Succeeded
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    engine.shutdown().await.unwrap();
+    coordinator.close().await.unwrap();
+    admission.close().await.unwrap();
+    support::store::remove_file(path).unwrap();
+}
+
+#[actix::test]
 async fn selected_run_restart_preserves_effect_and_exact_addressed_wait() {
     let directory = std::env::temp_dir().join(format!(
         "htlk-scope-{}-{}.sqlite",

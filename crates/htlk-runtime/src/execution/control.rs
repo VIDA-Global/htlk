@@ -4,10 +4,30 @@ use crate::{
     Runtime, RuntimeError,
     failure::{FailureCode, RuntimeFailure},
     records::{RunStatus, SecurityLabels},
-    store::{RecordFamily, RunLease, StoredRecord},
+    store::{DeadlineObservation, DeadlineTarget, RecordFamily, RunLease, StoredRecord},
 };
 use htlk_executable::cbor::Value;
 use std::{collections::BTreeSet, sync::Arc};
+
+pub(super) fn earliest(writes: &[crate::store::RecordWrite]) -> Option<i64> {
+    writes
+        .iter()
+        .filter_map(|write| {
+            if write.final_record
+                || !matches!(
+                    write.key.family,
+                    RecordFamily::Scope | RecordFamily::Invocation | RecordFamily::Usage
+                )
+            {
+                return None;
+            }
+            match map(&write.payload).ok()?.get("deadline_ms")? {
+                Value::Integer(at) => Some(*at),
+                _ => None,
+            }
+        })
+        .min()
+}
 
 pub(super) async fn all(
     runtime: &Runtime,
@@ -35,60 +55,38 @@ pub(super) async fn all(
     Ok(rows)
 }
 pub(super) async fn enforce(runtime: Arc<Runtime>, lease: RunLease) -> Result<(), RuntimeError> {
-    let header = runtime.store.run_header(lease.run_id()).await?;
-    if header.status.is_terminal() {
-        return Ok(());
-    }
-    let now = runtime
+    check(runtime, lease, None).await.map(|_| ())
+}
+
+pub(super) async fn check(
+    runtime: Arc<Runtime>,
+    lease: RunLease,
+    cached: Option<DeadlineObservation>,
+) -> Result<DeadlineObservation, RuntimeError> {
+    let (observation, target) = runtime
         .store
-        .coordinator_time(runtime.clock.now_ms()?)
+        .deadlines(lease.run_id(), runtime.clock.now_ms()?, cached)
         .await?;
-    let usage = runtime
-        .store
-        .record(lease.run_id(), &key(RecordFamily::Usage, "run"))
-        .await?;
-    if due(&usage.payload, now)? {
-        return stop(
-            runtime.as_ref(),
-            &lease,
-            None,
-            None,
-            FailureCode::Timeout,
-            false,
-            vec![],
-        )
-        .await;
-    }
-    for scope in all(&runtime, &lease, RecordFamily::Scope).await? {
-        if !scope.final_record && due(&scope.payload, now)? {
-            return stop(
-                &runtime,
-                &lease,
-                Some(&scope.key.id),
-                None,
-                FailureCode::Timeout,
-                false,
-                vec![],
-            )
-            .await;
+    let (scope, node, code) = match target {
+        None => return Ok(observation),
+        Some(DeadlineTarget::Run) => (None, None, FailureCode::Timeout),
+        Some(DeadlineTarget::Scope(id)) => (Some(id), None, FailureCode::Timeout),
+        Some(DeadlineTarget::Invocation(record)) => {
+            let code = node_timeout_code(&runtime, &lease, &record).await?;
+            (None, Some(record.key.id), code)
         }
-    }
-    for node in all(&runtime, &lease, RecordFamily::Invocation).await? {
-        if !node.final_record && due(&node.payload, now)? {
-            let code = node_timeout_code(&runtime, &lease, &node).await?;
-            return stop(
-                &runtime,
-                &lease,
-                None,
-                Some(&node.key.id),
-                code,
-                false,
-                vec![],
-            )
-            .await;
-        }
-    }
-    Ok(())
+    };
+    stop(
+        &runtime,
+        &lease,
+        scope.as_deref(),
+        node.as_deref(),
+        code,
+        false,
+        vec![],
+    )
+    .await?;
+    Ok(observation)
 }
 pub(super) async fn node_timeout_code(
     runtime: &Runtime,
@@ -111,9 +109,6 @@ pub(super) async fn node_timeout_code(
         }
     }
     Ok(FailureCode::Timeout)
-}
-fn due(value: &Value, now: i64) -> Result<bool, RuntimeError> {
-    Ok(matches!(map(value)?.get("deadline_ms"),Some(Value::Integer(n))if now>=*n))
 }
 pub(super) async fn stop(
     runtime: &Runtime,

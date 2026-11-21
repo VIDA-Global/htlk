@@ -131,7 +131,13 @@ impl Handler<WakeCommand> for Supervisor {
                 let owner = runtime.store.reserve_run_id().await?.to_string();
                 let lease = runtime
                     .store
-                    .acquire_candidate(&run, owner, now, now.saturating_add(lease_ms), true)
+                    .acquire_inner(
+                        &run,
+                        owner,
+                        now,
+                        now.saturating_add(lease_ms),
+                        crate::store::Acquisition::Parked,
+                    )
                     .await?;
                 let result = match super::recovery::validate(&runtime, &lease).await {
                     Ok(()) => apply(runtime.clone(), lease.clone(), command).await,

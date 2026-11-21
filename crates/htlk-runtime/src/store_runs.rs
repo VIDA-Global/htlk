@@ -98,13 +98,14 @@ impl SqliteStore {
     }
     pub(crate) async fn initialize_run(
         &self,
-        prepared: PreparedRun,
+        mut prepared: PreparedRun,
         request: HostRequest,
         time: AdmissionTime,
         retention: i64,
     ) -> Result<RunId, StoreError> {
         request.check(&self.config.limits)?;
         let limits = self.config.limits.clone();
+        artifacts::prepare_blobs(&mut prepared.artifacts, &limits)?;
         self.connection.call(move|db|->Result<RunId,StoreError>{
             let tx=db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let (observed, not_after_ms) = match time {
@@ -130,6 +131,7 @@ impl SqliteStore {
             let created=cbor::encode(&Value::Array(vec![Value::Text(prepared.fingerprint.to_string()),Value::Text(root.to_string())]),&limits)?;
             append_event(&tx,prepared.run_id.as_str(),1,EventMeta{kind:"run_created",actor:&request.principal,timestamp:now,causation:"start_run",command:None},&created,&limits)?;
             let records=prepared.initial_records(now,not_after_ms)?;
+            artifacts::stage_blobs(&tx,&prepared.artifacts)?;
             let failed=prepared.failure.is_some();
             let mut transition=Transition{context:TransitionContext{command_id:request.key.clone(),actor:request.principal.clone(),causation:request.method.clone(),timestamp_ms:now},writes:records,next_status:if failed{Some(RunStatus::Failed)}else{None},root:None,expected_fingerprint:Some(prepared.fingerprint)};
             let body=transitions::transition_body(&mut transition,&limits)?;

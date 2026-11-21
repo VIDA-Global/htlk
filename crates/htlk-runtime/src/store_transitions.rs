@@ -1,5 +1,6 @@
 //! Atomic revisioned record transitions and recoverable journal/outbox delivery.
 use super::*;
+use crate::artifact::PreparedArtifact;
 use htlk_executable::record_accounting::RecordAccounting;
 use std::collections::BTreeSet;
 
@@ -237,7 +238,7 @@ impl SqliteStore {
         observed: i64,
         deadline: i64,
         steps: Vec<Transition>,
-        blobs: Vec<crate::artifact::PreparedArtifact>,
+        mut blobs: Vec<PreparedArtifact>,
     ) -> Result<i64, StoreError> {
         timestamp(observed)?;
         if !(1..=8).contains(&steps.len())
@@ -255,11 +256,7 @@ impl SqliteStore {
         let observed = prepared.iter().fold(observed, |time, step| {
             time.max(step.transition.context.timestamp_ms)
         });
-        for blob in &blobs {
-            blob.metadata()
-                .verify_value(blob.bytes(), &limits)
-                .map_err(artifacts::artifact_error)?;
-        }
+        artifacts::prepare_blobs(&mut blobs, &limits)?;
         let lease = lease.clone();
         self.connection
             .write_run(lease.run_id().to_string(), move |db| {
@@ -273,9 +270,7 @@ impl SqliteStore {
                 if now >= deadline {
                     return Err(StoreError::Deadline(FailureCode::Timeout));
                 }
-                for blob in blobs {
-                    artifacts::stage_bytes(&tx, blob.metadata().storage_reference(), blob.bytes())?;
-                }
+                artifacts::stage_blobs(&tx, &blobs)?;
                 let mut sequence = sequence;
                 let span = prepared.len();
                 for transition in &prepared {
@@ -331,16 +326,18 @@ impl SqliteStore {
         lease: &RunLease,
         transition: Transition,
     ) -> Result<CommitReceipt, StoreError> {
-        self.commit_transition(lease, transition, None, false).await
+        self.commit_transition(lease, transition, None, false, Vec::new())
+            .await
     }
 
-    pub(crate) async fn commit_at_sequence(
+    pub(crate) async fn commit_with_artifacts(
         &self,
         lease: &RunLease,
         transition: Transition,
         sequence: Option<i64>,
+        blobs: Vec<PreparedArtifact>,
     ) -> Result<CommitReceipt, StoreError> {
-        self.commit_transition(lease, transition, sequence, true)
+        self.commit_transition(lease, transition, sequence, true, blobs)
             .await
     }
 
@@ -350,9 +347,12 @@ impl SqliteStore {
         transition: Transition,
         sequence: Option<i64>,
         coordinated: bool,
+        mut blobs: Vec<PreparedArtifact>,
     ) -> Result<CommitReceipt, StoreError> {
         let limits = self.config.limits.clone();
-        let prepared = PreparedTransition::new(lease, transition, &limits)?;
+        let mut prepared = PreparedTransition::new(lease, transition, &limits)?;
+        artifacts::prepare_blobs(&mut blobs, &limits)?;
+        prepared.blobs = blobs;
         let lease = lease.clone();
         self.connection
             .write_run(
@@ -376,15 +376,12 @@ impl SqliteStore {
         self.check_text(&key.id)?;
         let (run, key, limits) = (run.clone(), key.clone(), self.config.limits.clone());
         self.connection.read(move |db|->Result<StoredRecord,StoreError>{
-            let mut statement=db.prepare("SELECT revision,final,payload FROM records WHERE run_id=?1 AND family=?2 AND record_id=?3")?;
-            let mut rows=statement.query(params![run.as_str(),key.family.as_str(),key.id])?;
-            let row=rows.next()?.ok_or(StoreError::Missing)?;
-            let revision:i64=row.get(0)?;
-            let final_record:bool=row.get(1)?;
-            let bytes=row.get_ref(2)?.as_blob().map_err(|_|StoreError::Corrupt)?;
-            let payload=decode_stored(bytes,&limits)?;
+            let (revision, final_record, payload) = db.query_row("SELECT revision,final,payload FROM records WHERE run_id=?1 AND family=?2 AND record_id=?3", params![run.as_str(),key.family.as_str(),key.id], |row| {
+                let payload = row.get_ref(2)?.as_blob().map_err(|_| StoreError::Corrupt).and_then(|bytes| decode_stored(bytes, &limits));
+                Ok((row.get::<_,i64>(0)?, row.get::<_,bool>(1)?, payload))
+            })?;
             if revision<1 {return Err(StoreError::Corrupt)}
-            Ok(StoredRecord{key,revision,final_record,payload})
+            Ok(StoredRecord{key,revision,final_record,payload: payload?})
         }).await.map_err(StoreError::from_worker)
     }
     /// Reads a bounded journal page after an exclusive sequence cursor. A page may
@@ -577,6 +574,7 @@ pub(super) struct PreparedTransition {
     request_digest: Digest,
     event_payload: Vec<u8>,
     writes: Vec<Vec<u8>>,
+    blobs: Vec<PreparedArtifact>,
 }
 impl PreparedTransition {
     pub fn new(
@@ -620,6 +618,7 @@ impl PreparedTransition {
             request_digest,
             event_payload,
             writes,
+            blobs: Vec::new(),
         })
     }
     // The same transactional trust boundary is used by ordinary graph commits and
@@ -672,6 +671,7 @@ impl PreparedTransition {
             return Ok(CommitReceipt { sequence });
         }
         self.check_header(&header)?;
+        artifacts::stage_blobs(tx, &self.blobs)?;
         self.apply_records(tx, lease, now, limits)?;
         let sequence = header.sequence.checked_add(1).ok_or(StoreError::Invalid)?;
         let transition = &self.transition;

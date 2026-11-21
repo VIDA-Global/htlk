@@ -570,8 +570,7 @@ pub(super) async fn install(
         writes.push(insert(RecordFamily::Invocation, invocation, payload, false));
     }
     writes.extend(ancestry_usage(runtime, lease, &old_scope, &usage, id, mount).await?);
-    for artifact in artifacts {
-        runtime.store.stage_artifact(&artifact).await?;
+    for artifact in &artifacts {
         let metadata = artifact.metadata_at(now)?;
         writes.push(insert(
             RecordFamily::Artifact,
@@ -638,7 +637,7 @@ pub(super) async fn install(
     }
     runtime
         .store
-        .commit(
+        .commit_with_artifacts(
             lease,
             Transition {
                 context: TransitionContext {
@@ -655,6 +654,8 @@ pub(super) async fn install(
                 }),
                 expected_fingerprint: Some(request.expected_fingerprint),
             },
+            None,
+            artifacts,
         )
         .await
         .map_err(|e| {
