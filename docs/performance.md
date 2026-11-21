@@ -324,3 +324,28 @@ final report. WAL traffic fell 26.7%, and inspection positions fell 38.4%.
 The WAL counter measures application writes to the WAL file, excluding database
 checkpoint and device writes. These are single paired trials of one SQLite
 workflow, not a PostgreSQL capacity estimate.
+
+### Compact runtime rows on SQLite and PostgreSQL
+
+A follow-up replayed the same Task 104 trace with `pure_batch_steps=8` against
+`3d5e6ef` and `8dd45d6`. The recorded peers, waits, and final-report checks were
+the same on both backends. The PostgreSQL pair used an isolated copy of the NLT
+host selecting native PostgreSQL 16.15 on a dedicated Docker server. Each run
+used a fresh schema on the direct Docker network and started after a checkpoint.
+PostgreSQL WAL is the insert-LSN delta across the replay, including setup;
+SQLite WAL is the counter described above.
+
+| Measurement | SQLite control | SQLite compact | PostgreSQL control | PostgreSQL compact |
+| --- | ---: | ---: | ---: | ---: |
+| WAL bytes | 555,442,024 | 509,878,592 | 78,770,176 | 77,681,384 |
+| Outbox rows | 7,101 | 2,819 | 7,479 | 3,447 |
+| Command-table rows | 7,065 | 1,254 | 7,067 | 1,254 |
+| Record history plus change-feed rows | 30,465 | 16,622 | 30,860 | 17,251 |
+| Wall time | 57.68 s | 55.34 s | 700.48 s | 1,032.11 s |
+
+All four replays matched 24 model calls, 19 retail calls, 11 customer waits, and
+the final report. WAL fell 8.2% on SQLite and 1.4% on PostgreSQL. The compact
+PostgreSQL replay took 47% longer in this single pair. These runs had no draining
+outbox consumer; they measure write volume for one workflow and do not establish
+a throughput improvement, the cause of the elapsed-time difference, or behavior
+under concurrent load.
