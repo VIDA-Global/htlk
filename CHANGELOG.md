@@ -19,9 +19,16 @@ User-visible changes and compatibility boundaries are recorded here, following
 - Per-connection write-operation and affected-row counters for performance campaigns.
 - Repeatable release-mode performance campaigns for durable SQLite and PostgreSQL,
   with raw timing samples and correctness checks under load.
+- A PostgreSQL capacity sweep compares independent HTLK processes on one schema,
+  multiple schemas, and separate primaries, with per-partition backlog and latency
+  targets and optional PostgreSQL wait sampling.
 
 ### Changed
 
+- PostgreSQL publishes changed inspection records in ordered batches within the
+  authoritative transaction, reducing SQL calls under the inspection clock.
+  Capacity reports include publication timing and statement counts. Native
+  implementation identities change; the storage layout is unchanged.
 - Refresh the Cargo dependencies, including the pinned native engines. Native
   implementation identities and executable fingerprints change.
 - Idle execution discovery uses local wake hints, stored eligibility times and

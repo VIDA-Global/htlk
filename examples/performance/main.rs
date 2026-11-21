@@ -6,10 +6,12 @@ mod e2e;
 #[path = "../../tests/support/mod.rs"]
 mod support;
 
+mod capacity;
 mod mixed;
 mod recovery;
 mod workload;
 
+use capacity::Capacity;
 use htlk::runtime::{
     Runtime, RuntimeConfig,
     execution::{ExecutionConfig, ExecutionEngine},
@@ -17,7 +19,7 @@ use htlk::runtime::{
     records::RunStatus,
     store::{
         InspectionRunFilter, JournalEvent, PostgresConfig, PostgresStore, RecordFamily,
-        ReplayState, Store, StoreConfig, StorePosition,
+        ReplayState, Store, StoreConfig, StorePosition, StorePublicationMetrics,
     },
 };
 use htlk_executable::{
@@ -49,7 +51,8 @@ const HELP: &str =
   [--mix-nodes 0] [--parked-runs 0] adds deep/wide runs and a parked population to a one-node chain.
   [--pure-batch-steps 1] sets the opt-in eval batch limit (1–8).
   [--runs 0 --idle-ms 5000] measures an empty engine with no completion reader.
-  PostgreSQL requires HTLK_PERF_POSTGRES_URL for a disposable database.";
+  PostgreSQL requires HTLK_PERF_POSTGRES_URL for a disposable database.
+  Process coordination flags are managed by tools/postgres_capacity.py.";
 
 struct Config {
     backend: String,
@@ -74,6 +77,7 @@ struct Config {
     idle_ms: u64,
     cache: usize,
     work_dir: PathBuf,
+    capacity: Option<Capacity>,
 }
 
 impl Config {
@@ -124,6 +128,11 @@ impl Config {
             idle_ms: get("--idle-ms", "0").parse()?,
             cache: get("--cache", "16").parse()?,
             work_dir: get("--work-dir", "target").into(),
+            capacity: Capacity::new(
+                get("--capacity-schema", ""),
+                get("--capacity-driver-dir", ""),
+                get("--capacity-engine-dir", ""),
+            )?,
         };
         if let Some(key) = options.keys().next() {
             return Err(format!("unknown option: {key}").into());
@@ -152,6 +161,12 @@ impl Config {
             || (config.parked_runs > 0 && config.mix_nodes == 0)
             || (config.mix_nodes > 0 && (!config.workload.is_short_chain() || config.runs == 0))
             || (config.recovery_samples > 0 && !config.workload.is_wait())
+            || config.capacity.as_ref().is_some_and(|capacity| {
+                config.backend != "postgres"
+                    || !config.workload.is_short_chain()
+                    || config.coordinators != 1
+                    || (!capacity.engine_only && (config.rate == 0 || config.runs == 0))
+            })
         {
             return Err(
                 "invalid workload bounds; specify exactly one positive arrival rate or concurrency"
@@ -159,6 +174,20 @@ impl Config {
             );
         }
         Ok(config)
+    }
+
+    fn engine_config(&self) -> ExecutionConfig {
+        ExecutionConfig {
+            workers: self.workers,
+            max_runs: self.max_runs,
+            pure_batch_steps: self.pure_batch_steps,
+            poll_interval: Duration::from_millis(self.poll_ms),
+            ..Default::default()
+        }
+    }
+
+    fn graph_timeout_ms(&self) -> u64 {
+        if self.mix_nodes > 0 { 300_000 } else { 60_000 }
     }
 }
 
@@ -179,7 +208,7 @@ impl Database {
                 std::env::var("HTLK_PERF_POSTGRES_URL")
                     .map_err(|_| "set HTLK_PERF_POSTGRES_URL to a disposable database")?,
             );
-            settings.schema = id;
+            settings.schema = config.capacity.as_ref().map_or(id, |c| c.schema.clone());
             println!("metadata,postgres_schema,{}", settings.schema);
             Some(settings)
         } else {
@@ -297,27 +326,34 @@ impl Observer {
     }
 }
 
+struct Schedule<'a> {
+    count: usize,
+    offset: usize,
+    begin: Instant,
+    arrivals: Option<&'a [usize]>,
+}
+
 async fn submit(
     runtimes: &[Arc<Runtime>],
     graphs: [Digest; 3],
     config: &Config,
     slots: &Semaphore,
-    count: usize,
-    offset: usize,
-    begin: Instant,
+    schedule: &Schedule<'_>,
 ) -> Result<Vec<Submission>> {
     let mut tasks = JoinSet::new();
-    let mut submissions = Vec::with_capacity(count);
-    for i in 0..count {
-        let planned = if config.rate == 0 || offset == 0 {
+    let mut submissions = Vec::with_capacity(schedule.count);
+    for i in 0..schedule.count {
+        let arrival = schedule.arrivals.map_or(i, |arrivals| arrivals[i]);
+        let planned = if config.rate == 0 || schedule.offset == 0 {
             slots.acquire().await?.forget();
             Instant::now()
         } else {
-            let at = begin + Duration::from_nanos((i as u64 * 1_000_000_000) / config.rate);
+            let at = schedule.begin
+                + Duration::from_nanos((arrival as u64 * 1_000_000_000) / config.rate);
             sleep_until(at.into()).await;
             at
         };
-        let index = offset + i;
+        let index = schedule.offset + arrival;
         let fingerprint = graphs[mixed::class(index)];
         let runtime = runtimes[i % runtimes.len()].clone();
         let input = config.workload.input(index);
@@ -362,23 +398,19 @@ impl Campaign<'_> {
     async fn run(
         &self,
         observer: &mut Observer,
-        count: usize,
-        offset: usize,
+        schedule: Schedule<'_>,
     ) -> Result<(Vec<Submission>, BTreeMap<RunId, Instant>, Instant)> {
-        let begin = Instant::now();
         let slots = Semaphore::new(self.config.concurrency.max(1));
         let (submitted, completed) = timeout(Duration::from_secs(self.config.timeout_s), async {
             tokio::try_join!(
-                submit(
+                submit(self.runtimes, self.graphs, self.config, &slots, &schedule,),
+                observer.observe(
+                    self.reader,
                     self.runtimes,
-                    self.graphs,
                     self.config,
                     &slots,
-                    count,
-                    offset,
-                    begin
+                    schedule.count
                 ),
-                observer.observe(self.reader, self.runtimes, self.config, &slots, count),
             )
         })
         .await
@@ -388,12 +420,31 @@ impl Campaign<'_> {
                 self.config.timeout_s, observer.cursor
             )
         })??;
-        Ok((submitted, completed, begin))
+        Ok((submitted, completed, schedule.begin))
     }
 }
 
 fn micros(t: Duration) -> u128 {
     t.as_micros()
+}
+
+fn report_publication(after: StorePublicationMetrics, before: StorePublicationMetrics) {
+    println!(
+        "metadata,publication_commits,{}",
+        after.commits - before.commits
+    );
+    println!(
+        "metadata,publication_acquire_ns,{}",
+        after.acquire_ns - before.acquire_ns
+    );
+    println!(
+        "metadata,publication_hold_ns,{}",
+        after.hold_ns - before.hold_ns
+    );
+    println!(
+        "metadata,publication_statements,{}",
+        after.statements - before.statements
+    );
 }
 
 async fn verify(
@@ -490,6 +541,11 @@ async fn read_history(
 }
 
 async fn measure(config: Config) -> Result<()> {
+    if let Some(capacity) = &config.capacity
+        && capacity.engine_only
+    {
+        return capacity.serve(&config).await;
+    }
     let database = Database::new(&config)?;
     let primary = database.open(true).await?;
     // Measure initial persisted SQLite bytes with the WAL checkpointed.
@@ -500,20 +556,10 @@ async fn measure(config: Config) -> Result<()> {
     for _ in 1..config.coordinators {
         stores.push(database.open(false).await?);
     }
-    let timeout_ms = if config.mix_nodes > 0 {
-        300_000
-    } else {
-        60_000
-    };
-    let (compiler, registry) = support::native_compiler_with_timeouts(timeout_ms, 5_000);
+    let (compiler, registry) =
+        support::native_compiler_with_timeouts(config.graph_timeout_ms(), 5_000);
     let registry = Arc::new(registry);
-    let engine_config = ExecutionConfig {
-        workers: config.workers,
-        max_runs: config.max_runs,
-        pure_batch_steps: config.pure_batch_steps,
-        poll_interval: Duration::from_millis(config.poll_ms),
-        ..Default::default()
-    };
+    let engine_config = config.engine_config();
     if config.runs == 0 {
         let mut engines = Vec::new();
         for store in &stores {
@@ -644,7 +690,17 @@ async fn measure(config: Config) -> Result<()> {
         roots: BTreeMap::new(),
     };
     let early_pin = if config.warmup > 0 {
-        campaign.run(&mut observer, config.warmup, 0).await?;
+        campaign
+            .run(
+                &mut observer,
+                Schedule {
+                    count: config.warmup,
+                    offset: 0,
+                    begin: Instant::now(),
+                    arrivals: None,
+                },
+            )
+            .await?;
         let pin = reader.inspection_position().await?;
         read_history(&reader, &pin, config.history_samples, "history_small").await?;
         Some(pin)
@@ -656,8 +712,18 @@ async fn measure(config: Config) -> Result<()> {
 
     let mut readers = JoinSet::new();
     let (stop, active) = tokio::sync::watch::channel(false);
+    let mut reader_stores = Vec::new();
     for _ in 0..config.readers {
-        let reader = database.open(false).await?;
+        reader_stores.push(database.open(false).await?);
+    }
+    let (begin, arrivals) = if let Some(capacity) = &config.capacity {
+        let (begin, arrivals) = capacity.synchronize(config.runs).await?;
+        sleep_until(begin.into()).await;
+        (begin, Some(arrivals))
+    } else {
+        (Instant::now(), None)
+    };
+    for reader in reader_stores {
         let mut active = active.clone();
         readers.spawn_local(async move {
             let mut count = 0;
@@ -670,10 +736,37 @@ async fn measure(config: Config) -> Result<()> {
             Ok::<_, htlk::runtime::store::StoreError>(count)
         });
     }
+    let before_publication: Vec<_> = stores.iter().map(Store::publication_metrics).collect();
     let (submissions, completed, begin) = campaign
-        .run(&mut observer, config.runs, config.warmup.max(1))
+        .run(
+            &mut observer,
+            Schedule {
+                count: config.runs,
+                offset: if arrivals.is_some() {
+                    4096
+                } else {
+                    config.warmup.max(1)
+                },
+                begin,
+                arrivals: arrivals.as_deref(),
+            },
+        )
         .await?;
     let end = completed.values().copied().max().ok_or("no completions")?;
+    if config.backend == "postgres" {
+        let mut total = StorePublicationMetrics::default();
+        for (store, before) in stores.iter().zip(before_publication) {
+            let after = store.publication_metrics();
+            total.commits += after.commits - before.commits;
+            total.acquire_ns += after.acquire_ns - before.acquire_ns;
+            total.hold_ns += after.hold_ns - before.hold_ns;
+            total.statements += after.statements - before.statements;
+        }
+        report_publication(total, StorePublicationMetrics::default());
+    }
+    if let Some(capacity) = &config.capacity {
+        capacity.await_verification().await?;
+    }
     let _ = stop.send(true);
     let mut reader_pages = 0;
     while let Some(result) = readers.join_next().await {

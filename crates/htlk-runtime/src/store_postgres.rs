@@ -2,7 +2,7 @@
 
 use crate::{
     sqlite_worker,
-    store::{Store, StoreConfig, StoreError},
+    store::{RecordKey, Store, StoreConfig, StoreError},
     store_db::{self, Error, OperationMode, Value},
     store_postgres_client::{Client, Error as ClientError},
 };
@@ -150,6 +150,7 @@ pub(crate) struct Database {
     cursor: Cell<u64>,
     last_insert: Cell<i64>,
     affected_rows: Cell<u64>,
+    statements_issued: Cell<u64>,
     started: Cell<Option<Instant>>,
     broken: Cell<bool>,
     cursor_failed: Cell<bool>,
@@ -276,6 +277,7 @@ impl Database {
             cursor: Cell::new(0),
             last_insert: Cell::new(0),
             affected_rows: Cell::new(0),
+            statements_issued: Cell::new(0),
             started: Cell::new(None),
             broken: Cell::new(false),
             cursor_failed: Cell::new(false),
@@ -359,6 +361,8 @@ impl Database {
     }
     pub(crate) fn execute(&self, sql: &str, values: Vec<Value>) -> store_db::Result<usize> {
         self.deadline()?;
+        self.statements_issued
+            .set(self.statements_issued.get().wrapping_add(1));
         let mut sql = dialect(sql)?;
         let ordinal = [
             ("INSERT INTO mcp_epochs(", "epoch"),
@@ -391,6 +395,76 @@ impl Database {
     pub(crate) fn affected_rows(&self) -> u64 {
         self.affected_rows.get()
     }
+    pub(crate) fn statements_issued(&self) -> u64 {
+        self.statements_issued.get()
+    }
+
+    pub(crate) fn project_records(
+        &self,
+        run: &str,
+        position: i64,
+        run_number: i64,
+        sequence: i64,
+        keys: &[RecordKey],
+    ) -> store_db::Result<()> {
+        // Keep one statement shape and bound each server request. Both inserts
+        // assign ordinals in the order of the original deduplicated keys.
+        const CHUNK: usize = 64;
+        const SQL: &str = "
+            WITH wanted AS MATERIALIZED (
+                SELECT family, record_id, sha256(record_id) AS record_key, ordinal
+                FROM unnest($3::text[], $4::bytea[]) WITH ORDINALITY AS w(family, record_id, ordinal)
+            ), existing AS MATERIALIZED (
+                SELECT w.ordinal, k.record_number FROM wanted w
+                JOIN inspection_record_keys k ON k.run_key = sha256($1::bytea) AND k.run_id = $1
+                    AND k.family = w.family AND k.record_key = w.record_key AND k.record_id = w.record_id
+            ), added AS (
+                INSERT INTO inspection_record_keys(run_id, family, record_id, created_position)
+                SELECT $1, w.family, w.record_id, $2 FROM wanted w
+                WHERE NOT EXISTS (SELECT 1 FROM existing e WHERE e.ordinal = w.ordinal)
+                ORDER BY w.ordinal
+                RETURNING family, record_id, record_key, record_number
+            ), resolved AS (
+                SELECT ordinal, record_number FROM existing
+                UNION ALL
+                SELECT w.ordinal, a.record_number FROM wanted w JOIN added a
+                    ON a.family = w.family AND a.record_key = w.record_key AND a.record_id = w.record_id
+            )
+            INSERT INTO inspection_changes(record_number, position, run_number, sequence, revision, final, payload_digest)
+            SELECT r.record_number, $2, $5, $6, h.revision, h.final, h.payload_digest
+            FROM wanted w JOIN resolved r USING (ordinal)
+            JOIN record_heads h ON h.run_key = sha256($1::bytea) AND h.run_id = $1
+                AND h.family = w.family AND h.record_key = w.record_key AND h.record_id = w.record_id
+            ORDER BY w.ordinal";
+        for chunk in keys.chunks(CHUNK) {
+            self.deadline()?;
+            let families: Vec<_> = chunk.iter().map(|key| key.family.as_str()).collect();
+            let ids: Vec<_> = chunk.iter().map(|key| key.id.as_bytes()).collect();
+            let mut client = self.client.borrow_mut();
+            let statement = self.prepare(&mut client, SQL)?;
+            self.statements_issued
+                .set(self.statements_issued.get().wrapping_add(1));
+            let count = client
+                .execute(
+                    &statement,
+                    &[
+                        &run.as_bytes(),
+                        &position,
+                        &families,
+                        &ids,
+                        &run_number,
+                        &sequence,
+                    ],
+                )
+                .map_err(pg_error)?;
+            if count != chunk.len() as u64 {
+                return Err(Error::Database);
+            }
+            self.affected_rows
+                .set(self.affected_rows.get().saturating_add(count));
+        }
+        Ok(())
+    }
     pub(crate) fn last_insert_id(&self) -> i64 {
         self.last_insert.get()
     }
@@ -408,6 +482,8 @@ impl Database {
     }
     pub(crate) fn query_one(&self, sql: &str, values: Vec<Value>) -> store_db::Result<Vec<Value>> {
         self.deadline()?;
+        self.statements_issued
+            .set(self.statements_issued.get().wrapping_add(1));
         let sql = bounded_projection(&dialect(sql)?, self.maximum_field_bytes)?;
         let mut client = self.client.borrow_mut();
         let statement = self.prepare(&mut client, &sql)?;

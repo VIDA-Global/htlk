@@ -575,6 +575,40 @@ impl Connection {
     pub(crate) fn is_postgres(&self) -> bool {
         matches!(self, Self::Postgres(_))
     }
+    #[cfg(feature = "postgres")]
+    pub(crate) fn publication_clock(&self) -> Option<(std::time::Instant, u64)> {
+        match self {
+            Self::Postgres(db) => Some((std::time::Instant::now(), db.statements_issued())),
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(_) => None,
+        }
+    }
+    #[cfg(feature = "postgres")]
+    pub(crate) fn publication_sample(&self) -> Option<crate::store::StorePublicationMetrics> {
+        match self {
+            Self::Postgres(db) => db
+                .projection
+                .borrow_mut()
+                .publication_sample(db.statements_issued()),
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(_) => None,
+        }
+    }
+    #[cfg(feature = "postgres")]
+    pub(crate) fn project_postgres_records(
+        &self,
+        run: &str,
+        position: i64,
+        run_number: i64,
+        sequence: i64,
+        keys: &[crate::store::RecordKey],
+    ) -> Result<()> {
+        match self {
+            Self::Postgres(db) => db.project_records(run, position, run_number, sequence, keys),
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(_) => Err(Error::Invalid),
+        }
+    }
     pub(crate) fn finish_operation(&self, success: bool) -> Result<()> {
         match self {
             #[cfg(feature = "postgres")]

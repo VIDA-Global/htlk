@@ -126,6 +126,19 @@ pub struct StoreWriteMetrics {
     pub rows: u64,
 }
 
+/// Client-observed totals for acknowledged PostgreSQL inspection publications.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StorePublicationMetrics {
+    /// Physical commits that published a historical position.
+    pub commits: u64,
+    /// Time for the lock-acquisition query, including its round trip.
+    pub acquire_ns: u64,
+    /// Time from the lock query returning through the guarded commit response.
+    pub hold_ns: u64,
+    /// Projection SQL calls, including lock acquisition but excluding COMMIT.
+    pub statements: u64,
+}
+
 #[cfg(feature = "postgres")]
 pub use crate::store_postgres::{PostgresConfig, PostgresStore};
 
@@ -222,6 +235,12 @@ impl Store {
     /// quiescence for a consistent operation/row pair.
     pub fn write_metrics(&self) -> StoreWriteMetrics {
         self.connection.write_metrics()
+    }
+
+    /// Returns advisory cumulative publication counters for this shared worker.
+    /// SQLite returns zeroes. Sample after quiescing for a consistent snapshot.
+    pub fn publication_metrics(&self) -> StorePublicationMetrics {
+        self.connection.publication_metrics()
     }
     /// Closes this connection and its clones after queued operations finish.
     /// Separately opened database connections remain usable.

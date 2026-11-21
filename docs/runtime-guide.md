@@ -104,10 +104,14 @@ The checked PostgreSQL construction helper is in the
 [runtime crate README](../crates/htlk-runtime/README.md#storage-backends).
 Clones share one connection worker and at most 256 queued operations. Independently
 opened handles use independent connections and arbitrate through database
-transactions. The current PostgreSQL implementation serializes reads/writes per
-HTLK schema, preserving the same fenced authority and compound callback-accounting
-boundaries as SQLite. Size host connection counts, leases and workflow deadlines
-for observed database/provider latency; reopening does not extend saved deadlines.
+transactions. Independent runs can make progress concurrently on PostgreSQL, but
+journaled transactions serialize inspection publication per schema. Multi-domain
+operations also take an exclusive schema-scoped gate. These boundaries preserve
+fenced authority and compound callback accounting. Use the
+[PostgreSQL capacity campaign](performance.md#postgresql-horizontal-capacity) to
+compare adding processes against one store with adding independent stores. Size
+host connection counts, leases and workflow deadlines for observed database/provider
+latency; reopening does not extend saved deadlines.
 
 For backup/restore, retain the complete schema, including namespace, counters,
 sequences, receipts, journal, artifact bytes and protected MCP evidence. Use

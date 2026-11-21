@@ -130,9 +130,12 @@ coordinate retention, callback accounting, initialization, and ID-block reservat
 against those run writers. Time probes are read-only and account for committed run
 timestamps. Journaled writers lock the inspection clock
 at publication and hold it through physical commit, preserving committed positions
-and ordinals. Domain write boundaries use savepoints inside READ COMMITTED
-transactions. Selected scheduling, journal, and historical reads use REPEATABLE
-READ READ ONLY transactions without an advisory lock.
+and ordinals. PostgreSQL resolves record keys and inserts final record versions
+in ordered batches of up to 64 distinct keys. The position's watermark is written
+after all versions, in the same transaction. Domain write boundaries use
+savepoints inside READ COMMITTED transactions. Selected scheduling, journal,
+and historical reads use REPEATABLE READ READ ONLY transactions without an
+advisory lock.
 The PostgreSQL driver caches at most 256 prepared statements. Single-row lookups
 use their native prepared query directly; scans use server cursors with a bounded
 16-row wire buffer and incremental domain decoding/page accounting.
