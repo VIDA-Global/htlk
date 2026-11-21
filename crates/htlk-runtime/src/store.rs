@@ -55,6 +55,7 @@ pub use partitions::{PartitionPositions, StorePartitions};
 
 #[path = "store_execution.rs"]
 mod execution;
+pub(crate) use execution::{DeadlineObservation, DeadlineTarget};
 
 #[path = "store_runs.rs"]
 pub(crate) mod runs;
@@ -331,12 +332,39 @@ impl Store {
         expires_at_ms: i64,
     ) -> Result<(), StoreError> {
         check_lease_times(now_ms, expires_at_ms)?;
+        self.renew_inner(lease, now_ms, Renewal::Expiry(expires_at_ms))
+            .await
+    }
+
+    pub(crate) async fn renew_for(
+        &self,
+        lease: &RunLease,
+        observed: i64,
+        duration: i64,
+    ) -> Result<(), StoreError> {
+        timestamp(observed)?;
+        self.renew_inner(lease, observed, Renewal::Duration(duration))
+            .await
+    }
+
+    async fn renew_inner(
+        &self,
+        lease: &RunLease,
+        now_ms: i64,
+        renewal: Renewal,
+    ) -> Result<(), StoreError> {
         let limits = self.config.limits.clone();
         let lease = lease.clone();
         self.connection.write_run(lease.run_id().to_string(), move |db| -> Result<(), StoreError> {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let header = load_header(&tx, &lease.run_id)?;
-            let now = now_ms.max(header.last_time_ms);
+            let (now, expires_at_ms) = match renewal {
+                Renewal::Expiry(expiry) => (now_ms.max(header.last_time_ms), expiry),
+                Renewal::Duration(duration) => {
+                    let now = runs::observed_time(&tx, now_ms)?.max(header.last_time_ms);
+                    (now, now.saturating_add(duration))
+                }
+            };
             check_authority(&header, &lease, now)?;
             if header.status.is_terminal() { return Err(StoreError::Terminal); }
             if expires_at_ms <= now || header.expires_at_ms.is_some_and(|old| expires_at_ms < old) { return Err(StoreError::Invalid); }
@@ -371,6 +399,11 @@ pub(crate) enum Acquisition {
     Authority,
     Due,
     Parked,
+}
+
+enum Renewal {
+    Expiry(i64),
+    Duration(i64),
 }
 
 /// Validated run identity and graph selected by the calling runtime service.

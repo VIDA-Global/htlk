@@ -13,7 +13,109 @@ pub(crate) struct DueRuns {
     pub next_eligible: Option<i64>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct DeadlineObservation {
+    pub sequence: i64,
+    pub now: i64,
+    pub next: Option<i64>,
+}
+
+pub(crate) enum DeadlineTarget {
+    Run,
+    Scope(String),
+    Invocation(StoredRecord),
+}
+
 impl SqliteStore {
+    /// Load one small group of exact checkpoint IDs, never their artifact bytes.
+    /// An oversized group can be retried as independent point lookups.
+    pub(crate) async fn invocation_group(
+        &self,
+        run: &RunId,
+        ids: Vec<String>,
+    ) -> Result<Option<Vec<StoredRecord>>, StoreError> {
+        if ids.len() < 2 || ids.len() > self.config.max_page_size.min(16) {
+            return Err(StoreError::Invalid);
+        }
+        let run = run.clone();
+        let limits = self.config.limits.clone();
+        self.connection.read(move |db| {
+            let run = run.as_str();
+            let params: Vec<&dyn rusqlite::ToSql> = std::iter::once(&run as &dyn rusqlite::ToSql).chain(ids.iter().map(|id| id as &dyn rusqlite::ToSql)).collect();
+            let placeholders = (2..=params.len()).map(|n| format!("?{n}")).collect::<Vec<_>>().join(",");
+            let mut statement = db.prepare(&format!("SELECT record_id,revision,final,payload FROM records WHERE run_id=?1 AND family='invocation' AND record_id IN ({placeholders})"))?;
+            let mut rows = statement.query(params.as_slice())?;
+            let mut total = 0usize;
+            let mut records = Vec::new();
+            while let Some(row) = rows.next()? {
+                let id = transitions::text(row, 0, &limits)?;
+                let raw = row.get_ref(3)?.as_blob().map_err(|_| StoreError::Corrupt)?;
+                total = total.saturating_add(id.len()).saturating_add(raw.len());
+                if total > limits.max_document_bytes { return Ok(None); }
+                let revision = row.get(1)?;
+                if revision < 1 { return Err(StoreError::Corrupt); }
+                records.push(StoredRecord {
+                    key: RecordKey { family: RecordFamily::Invocation, id },
+                    revision, final_record: row.get(2)?,
+                    payload: transitions::decode_stored(raw, &limits)?,
+                });
+            }
+            Ok(Some(records))
+        }).await.map_err(StoreError::from_worker)
+    }
+
+    /// Reuse the last deadline reduction only while its sequence is still current
+    /// and no deadline could be due. Select due targets in the same snapshot.
+    pub(crate) async fn deadlines(
+        &self,
+        run: &RunId,
+        observed: i64,
+        cached: Option<DeadlineObservation>,
+    ) -> Result<(DeadlineObservation, Option<DeadlineTarget>), StoreError> {
+        let run = run.clone();
+        let limits = self.config.limits.clone();
+        self.connection.read(move |db| {
+            let tx = db.transaction()?;
+            let (sequence, running): (i64, bool) = tx.query_row(
+                "SELECT sequence,status='running' FROM runs WHERE run_id=?1",
+                [run.as_str()], |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let now = if running { runs::observed_time(&tx, observed)? } else { observed };
+            let mut result = DeadlineObservation { sequence, now, next: None };
+            let mut target = None;
+            if running {
+                if let Some(old) = cached.filter(|old| old.sequence == sequence && old.next.is_none_or(|next| next > now)) {
+                    result.next = old.next;
+                } else {
+                    let mut statement = tx.prepare("SELECT family,record_id,revision,payload FROM records WHERE run_id=?1 AND ((family='usage' AND record_id='run') OR (family IN ('scope','invocation') AND final=0)) ORDER BY family DESC,record_id")?;
+                    let mut rows = statement.query([run.as_str()])?;
+                    while let Some(row) = rows.next()? {
+                        let raw = row.get_ref(3)?.as_blob().map_err(|_| StoreError::Corrupt)?;
+                        let payload = transitions::decode_stored(raw, &limits)?;
+                        let Value::Map(fields) = &payload else { return Err(StoreError::Corrupt); };
+                        let Some(Value::Integer(at)) = fields.get("deadline_ms") else { continue; };
+                        result.next = Some(result.next.map_or(*at, |old| old.min(*at)));
+                        if *at <= now {
+                            let family = transitions::text(row, 0, &limits)?;
+                            target = Some(match family.as_str() {
+                                "usage" => DeadlineTarget::Run,
+                                "scope" => DeadlineTarget::Scope(transitions::text(row, 1, &limits)?),
+                                "invocation" => DeadlineTarget::Invocation(StoredRecord {
+                                    key: RecordKey { family: RecordFamily::Invocation, id: transitions::text(row, 1, &limits)? },
+                                    revision: row.get(2)?, final_record: false, payload,
+                                }),
+                                _ => return Err(StoreError::Corrupt),
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok((result, target))
+        }).await.map_err(StoreError::from_worker)
+    }
+
     pub(crate) async fn parked_deadline(&self, run: &RunId) -> Result<Option<i64>, StoreError> {
         let run = run.clone();
         self.connection.read(move |db| {

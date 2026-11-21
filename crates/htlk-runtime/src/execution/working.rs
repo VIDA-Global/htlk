@@ -13,6 +13,7 @@ tokio::task_local! { pub(super) static WORKING: RefCell<Slot>; }
 pub(super) struct WorkingSet {
     pub sequence: i64,
     pub scopes_complete: bool,
+    pub deadline_hint: Option<i64>,
     records: BTreeMap<RecordKey, (StoredRecord, usize)>,
     bytes: usize,
     waiting: BTreeSet<String>,
@@ -20,6 +21,10 @@ pub(super) struct WorkingSet {
 }
 
 impl WorkingSet {
+    pub fn note_deadline(&mut self, deadline: Option<i64>) {
+        self.deadline_hint = self.deadline_hint.into_iter().chain(deadline).min();
+    }
+
     pub fn reset(&mut self, sequence: i64) {
         *self = Self {
             sequence,

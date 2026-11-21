@@ -376,15 +376,12 @@ impl SqliteStore {
         self.check_text(&key.id)?;
         let (run, key, limits) = (run.clone(), key.clone(), self.config.limits.clone());
         self.connection.read(move |db|->Result<StoredRecord,StoreError>{
-            let mut statement=db.prepare("SELECT revision,final,payload FROM records WHERE run_id=?1 AND family=?2 AND record_id=?3")?;
-            let mut rows=statement.query(params![run.as_str(),key.family.as_str(),key.id])?;
-            let row=rows.next()?.ok_or(StoreError::Missing)?;
-            let revision:i64=row.get(0)?;
-            let final_record:bool=row.get(1)?;
-            let bytes=row.get_ref(2)?.as_blob().map_err(|_|StoreError::Corrupt)?;
-            let payload=decode_stored(bytes,&limits)?;
+            let (revision, final_record, payload) = db.query_row("SELECT revision,final,payload FROM records WHERE run_id=?1 AND family=?2 AND record_id=?3", params![run.as_str(),key.family.as_str(),key.id], |row| {
+                let payload = row.get_ref(2)?.as_blob().map_err(|_| StoreError::Corrupt).and_then(|bytes| decode_stored(bytes, &limits));
+                Ok((row.get::<_,i64>(0)?, row.get::<_,bool>(1)?, payload))
+            })?;
             if revision<1 {return Err(StoreError::Corrupt)}
-            Ok(StoredRecord{key,revision,final_record,payload})
+            Ok(StoredRecord{key,revision,final_record,payload: payload?})
         }).await.map_err(StoreError::from_worker)
     }
     /// Reads a bounded journal page after an exclusive sequence cursor. A page may

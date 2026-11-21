@@ -32,7 +32,7 @@ use crate::{
     Runtime, RuntimeError,
     failure::FailureCode,
     identity::RunId,
-    store::{Acquisition, RunLease, StoreError},
+    store::{Acquisition, DeadlineObservation, RunLease, StoreError},
 };
 use actix::WeakAddr;
 use actix::prelude::*;
@@ -388,6 +388,9 @@ impl Handler<Poll> for Supervisor {
                             initial_time: now,
                             renew_after: now.saturating_add(actor.config.lease_ms / 3),
                             checking: false,
+                            deadlines: None,
+                            deadline_wake: None,
+                            deadline_hint: None,
                             working: Some(working::WorkingSet::default()),
                         }
                         .start();
@@ -443,7 +446,32 @@ struct Coordinator {
     initial_time: i64,
     renew_after: i64,
     checking: bool,
+    deadlines: Option<DeadlineObservation>,
+    deadline_wake: Option<(Instant, SpawnHandle)>,
+    deadline_hint: Option<i64>,
     working: working::Slot,
+}
+
+impl Coordinator {
+    fn wake_deadline(&mut self, ctx: &mut Context<Self>, delay: Duration) {
+        let delay = delay.min(self.config.poll_interval.max(Duration::from_millis(250)));
+        let at = Instant::now() + delay;
+        if let Some((old_at, handle)) = self.deadline_wake {
+            if old_at <= at {
+                return;
+            }
+            ctx.cancel_future(handle);
+        }
+        let handle = ctx.run_later(delay, |actor, ctx| {
+            actor.deadline_wake = None;
+            ctx.notify(CheckDeadline);
+        });
+        self.deadline_wake = Some((at, handle));
+    }
+}
+
+fn deadline_delay(at: i64, now: i64) -> Duration {
+    Duration::from_millis(at.saturating_sub(now).max(0) as u64)
 }
 enum CoordinationState {
     Acquiring,
@@ -495,12 +523,18 @@ impl Actor for Coordinator {
                         return;
                     }
                     actor.state = CoordinationState::Recovering(lease);
+                    ctx.notify(CheckDeadline);
                     ctx.notify(Pulse)
                 }
                 Err(_) => ctx.stop(),
             }),
         );
         ctx.run_interval(self.config.poll_interval, |_, ctx| ctx.notify(Pulse));
+        let renewal_tick = self
+            .config
+            .poll_interval
+            .min(Duration::from_millis(self.config.lease_ms as u64 / 3));
+        ctx.run_interval(renewal_tick, |_, ctx| ctx.notify(RenewLease));
     }
     fn stopped(&mut self, _: &mut Self::Context) {
         self.stop.cancel();
@@ -509,26 +543,68 @@ impl Actor for Coordinator {
         }
     }
 }
-struct Pulse;
-impl Message for Pulse {
+struct CheckDeadline;
+impl Message for CheckDeadline {
     type Result = ();
 }
-impl Handler<Pulse> for Coordinator {
+impl Handler<CheckDeadline> for Coordinator {
     type Result = ();
-    fn handle(&mut self, _: Pulse, ctx: &mut Self::Context) {
+    fn handle(&mut self, _: CheckDeadline, ctx: &mut Self::Context) {
+        if self.checking {
+            return;
+        }
         let Some(lease) = self.state.lease().cloned() else {
             return;
         };
-        if !self.checking {
-            self.checking = true;
-            let runtime = self.runtime.clone();
-            let check = lease.clone();
-            ctx.spawn(
-                control::enforce(runtime, check)
-                    .into_actor(self)
-                    .map(|_, actor, _| actor.checking = false),
-            );
-        }
+        self.checking = true;
+        ctx.spawn(
+            control::check(self.runtime.clone(), lease, self.deadlines)
+                .into_actor(self)
+                .map(|result, actor, ctx| {
+                    actor.checking = false;
+                    let delay = match result {
+                        Ok(observed) => {
+                            actor.deadlines = Some(observed);
+                            let next = observed
+                                .next
+                                .into_iter()
+                                .chain(actor.deadline_hint.take())
+                                .min();
+                            let now = actor
+                                .runtime
+                                .clock
+                                .now_ms()
+                                .unwrap_or(observed.now)
+                                .max(observed.now);
+                            // The cap reconciles independent writers and clock jumps.
+                            let ceiling =
+                                actor.config.poll_interval.max(Duration::from_millis(250));
+                            next.map_or(ceiling, |at| deadline_delay(at, now))
+                        }
+                        Err(RuntimeError::Storage(
+                            StoreError::Fenced | StoreError::CommitUnknown,
+                        )) => {
+                            ctx.stop();
+                            return;
+                        }
+                        Err(_) => actor.config.poll_interval,
+                    };
+                    actor.wake_deadline(ctx, delay);
+                }),
+        );
+    }
+}
+
+struct RenewLease;
+impl Message for RenewLease {
+    type Result = ();
+}
+impl Handler<RenewLease> for Coordinator {
+    type Result = ();
+    fn handle(&mut self, _: RenewLease, ctx: &mut Self::Context) {
+        let Some(lease) = self.state.lease().cloned() else {
+            return;
+        };
         if !self.renewing
             && self
                 .runtime
@@ -539,16 +615,11 @@ impl Handler<Pulse> for Coordinator {
             self.renewing = true;
             let runtime = self.runtime.clone();
             let duration = self.config.lease_ms;
-            let lease = lease.clone();
             ctx.spawn(
                 async move {
-                    let now = runtime
-                        .store
-                        .coordinator_time(runtime.clock.now_ms()?)
-                        .await?;
                     runtime
                         .store
-                        .renew(&lease, now, now.saturating_add(duration))
+                        .renew_for(&lease, runtime.clock.now_ms()?, duration)
                         .await
                         .map_err(RuntimeError::from)
                 }
@@ -567,9 +638,22 @@ impl Handler<Pulse> for Coordinator {
                 }),
             );
         }
+    }
+}
+
+struct Pulse;
+impl Message for Pulse {
+    type Result = ();
+}
+impl Handler<Pulse> for Coordinator {
+    type Result = ();
+    fn handle(&mut self, _: Pulse, ctx: &mut Self::Context) {
         if self.busy {
             return;
         }
+        let Some(lease) = self.state.lease().cloned() else {
+            return;
+        };
         self.busy = true;
         ctx.spawn(
             self.workers
@@ -584,7 +668,16 @@ impl Handler<Pulse> for Coordinator {
                 .into_actor(self)
                 .map(|result, actor, ctx| {
                     actor.busy = false;
-                    let result = result.map(|(result, working)| {
+                    let result = result.map(|(result, mut working)| {
+                        if let Some(at) = working.as_mut().and_then(|set| set.deadline_hint.take())
+                        {
+                            if actor.checking {
+                                actor.deadline_hint =
+                                    actor.deadline_hint.into_iter().chain(Some(at)).min();
+                            } else if let Ok(now) = actor.runtime.clock.now_ms() {
+                                actor.wake_deadline(ctx, deadline_delay(at, now));
+                            }
+                        }
                         actor.working = working;
                         result
                     });
