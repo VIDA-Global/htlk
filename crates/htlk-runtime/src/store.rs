@@ -16,7 +16,7 @@ use htlk_executable::{
 };
 use std::{fmt, path::Path, time::Duration};
 
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 const APPLICATION_ID: i64 = 0x48544c4b;
 const SCHEMA: &str = include_str!("store.sql");
 const REGISTRATION_SCHEMA: &str = include_str!("store_registration.sql");
@@ -507,7 +507,7 @@ fn append_event(
     payload: &[u8],
     limits: &Limits,
 ) -> Result<(), StoreError> {
-    append_journal(tx, run, sequence, event, payload, limits)?;
+    append_journal(tx, run, sequence, event, payload, limits, false)?;
     tx.execute(
         "INSERT INTO outbox(run_id,sequence) VALUES(?1,?2)",
         params![run, sequence],
@@ -521,6 +521,7 @@ fn append_journal(
     event: EventMeta<'_>,
     payload: &[u8],
     limits: &Limits,
+    pure_receipt: bool,
 ) -> Result<(), StoreError> {
     // Journal rows are private records. Bound the complete logical row before it
     // becomes authoritative, including the opaque already-bounded payload bytes.
@@ -528,7 +529,7 @@ fn append_journal(
     htlk_executable::record_accounting::RecordAccounting::new(limits)?
         .value(&representation, 0)
         .map_err(|_| StoreError::Invalid)?;
-    tx.execute("INSERT INTO journal(run_id,sequence,event_type,record_version,actor,timestamp_ms,causation,command_id,payload) VALUES(?1,?2,?3,'0.1',?4,?5,?6,?7,?8)", params![run,sequence,event.kind,event.actor,event.timestamp,event.causation,event.command,payload])?;
+    tx.execute("INSERT INTO journal(run_id,sequence,event_type,record_version,actor,timestamp_ms,causation,command_id,payload,pure_receipt) VALUES(?1,?2,?3,'0.1',?4,?5,?6,?7,?8,?9)", params![run,sequence,event.kind,event.actor,event.timestamp,event.causation,event.command,payload,pure_receipt])?;
     inspection::project(tx, run, event.kind, payload, limits)?;
     Ok(())
 }

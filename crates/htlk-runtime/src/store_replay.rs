@@ -3,6 +3,17 @@ use super::transitions::{command_digest, next_revision};
 use super::*;
 use std::collections::BTreeMap;
 
+pub(super) fn recorded_command_digest(
+    run: &RunId,
+    actor: &str,
+    causation: &str,
+    payload: &Value,
+    limits: &Limits,
+) -> Result<Digest, StoreError> {
+    let [_, _, body] = array::<3>(payload)?;
+    command_digest(run, actor, causation, body, limits)
+}
+
 /// Bounded journal reconstruction, with no database connection or dispatch
 /// capability. This is a verification/recovery aid, not compiler admission proof.
 /// Apply successive bounded pages rather than retaining the complete history.
@@ -242,7 +253,13 @@ impl ReplayState {
         if self.commands.contains_key(command) {
             return Err(StoreError::Corrupt);
         }
-        let digest = command_digest(&entry.run_id, &entry.actor, &entry.causation, body, limits)?;
+        let digest = recorded_command_digest(
+            &entry.run_id,
+            &entry.actor,
+            &entry.causation,
+            &entry.payload,
+            limits,
+        )?;
         self.apply_body(body, limits, false)?;
         self.retained_bytes = self
             .retained_bytes

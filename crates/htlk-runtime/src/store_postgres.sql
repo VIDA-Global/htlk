@@ -1,4 +1,4 @@
--- Native PostgreSQL layout 5. Canonical CBOR remains authoritative.
+-- Native PostgreSQL layout 6. Canonical CBOR remains authoritative.
 -- Arbitrary UTF-8 identities are BYTEA (including NUL). Generated SHA-256 keys
 -- bound B-tree entries without narrowing admitted identity sizes. The preimage
 -- registry rejects collisions before any ON CONFLICT operation can conflate keys.
@@ -72,8 +72,10 @@ CREATE TABLE journal (
     causation BYTEA NOT NULL,
     command_id BYTEA,
     payload BYTEA NOT NULL,
+    pure_receipt BIGINT NOT NULL DEFAULT 0 CHECK(pure_receipt IN (0,1) AND (pure_receipt=0 OR (event_type='records_committed' AND command_id IS NOT NULL))),
     PRIMARY KEY(run_key,sequence)
 );
+CREATE UNIQUE INDEX journal_pure_receipts ON journal(run_key,sha256(command_id)) WHERE pure_receipt=1;
 CREATE TRIGGER journal_keys BEFORE INSERT OR UPDATE OF run_id ON journal
     FOR EACH ROW EXECUTE FUNCTION htlk_check_keys('run_id');
 CREATE TABLE outbox (

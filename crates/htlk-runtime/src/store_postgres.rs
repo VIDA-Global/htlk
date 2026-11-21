@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const APPLICATION_ID: &str = "htlk.runtime.postgres";
 const SCHEMA: &str = include_str!("store_postgres.sql");
 
@@ -657,6 +657,12 @@ fn indexed_predicates(sql: &str) -> String {
                 "producer_id" => "producer_key",
                 "port" => "port_key",
                 "command_id" if sql.contains("FROM commands") => "command_key",
+                "command_id" if sql.contains("FROM journal WHERE pure_receipt=1") => {
+                    return format!(
+                        "(sha256({alias}command_id)=sha256(${}) AND {})",
+                        &capture[3], &capture[0]
+                    );
+                }
                 "principal" if sql.contains("receipts") => "principal_key",
                 "target" if sql.contains("host_receipts") => "target_key",
                 "idempotency_key" => "idempotency_key_hash",

@@ -277,19 +277,9 @@ impl SqliteStore {
                     artifacts::stage_bytes(&tx, blob.metadata().storage_reference(), blob.bytes())?;
                 }
                 let mut sequence = sequence;
-                let mut receipts = Vec::with_capacity(prepared.len());
-                let mut seen = std::collections::BTreeMap::new();
+                let span = prepared.len();
                 for transition in &prepared {
-                    if let Some(digest) =
-                        seen.insert(transition.command_id(), transition.request_digest)
-                    {
-                        return Err(if digest == transition.request_digest {
-                            StoreError::Conflict
-                        } else {
-                            StoreError::IdempotencyConflict
-                        });
-                    }
-                    if transition.receipt(&tx, &lease)?.is_some() {
+                    if transition.receipt(&tx, &lease, &limits)?.is_some() {
                         return Err(StoreError::Conflict);
                     }
                     transition.check_header(&header)?;
@@ -302,12 +292,8 @@ impl SqliteStore {
                         transition.event(now),
                         &transition.event_payload,
                         &limits,
+                        true,
                     )?;
-                    receipts.push((
-                        transition.command_id(),
-                        transition.request_digest.to_string(),
-                        sequence,
-                    ));
                 }
                 // Pure batches cannot change the root, status or owner. Keep the
                 // final high-water marks in one run-row/index update.
@@ -315,7 +301,13 @@ impl SqliteStore {
                     "UPDATE runs SET sequence=?2,last_time_ms=?3 WHERE run_id=?1",
                     params![lease.run_id().as_str(), sequence, now],
                 )?;
-                insert_batch_notices(&tx, lease.run_id(), &receipts)?;
+                if tx.execute(
+                    "INSERT INTO outbox(run_id,sequence,span,pending) VALUES(?1,?2,?3,?4)",
+                    params![lease.run_id().as_str(), sequence, span, (1_i64 << span) - 1],
+                )? != 1
+                {
+                    return Err(StoreError::Database);
+                }
                 tx.commit()?;
                 Ok(sequence)
             })
@@ -534,41 +526,6 @@ fn outbox_range(end: i64, span: i64, pending: i64) -> Result<OutboxRange, StoreE
     })
 }
 
-// At most eight commands. Parameter 1 is shared by every row; values never
-// enter the SQL string. The journal retains every sequence and both indexes
-// retain individually addressable receipts/acknowledgements.
-fn insert_batch_notices(
-    tx: &rusqlite::Transaction<'_>,
-    run: &RunId,
-    receipts: &[(&str, String, i64)],
-) -> Result<(), StoreError> {
-    use std::fmt::Write as _;
-    let mut commands =
-        String::from("INSERT INTO commands(run_id,command_id,request_digest,sequence) VALUES");
-    let run_id = run.as_str();
-    let mut command_params: Vec<&dyn rusqlite::ToSql> = vec![&run_id];
-    for (i, (id, digest, sequence)) in receipts.iter().enumerate() {
-        if i > 0 {
-            commands.push(',');
-        }
-        let start = i * 3 + 2;
-        write!(commands, "(?1,?{start},?{},?{})", start + 1, start + 2)
-            .expect("infallible String formatting");
-        command_params.extend([id as &dyn rusqlite::ToSql, digest, sequence]);
-    }
-    let span = receipts.len();
-    let end = receipts.last().ok_or(StoreError::Invalid)?.2;
-    if tx.execute(&commands, command_params.as_slice())? != span
-        || tx.execute(
-            "INSERT INTO outbox(run_id,sequence,span,pending) VALUES(?1,?2,?3,?4)",
-            params![run_id, end, span, (1_i64 << span) - 1],
-        )? != 1
-    {
-        return Err(StoreError::Database);
-    }
-    Ok(())
-}
-
 // Pure acceptance predicates are evaluated at the transaction's authoritative
 // time, even if proposal construction checked an earlier clock observation.
 fn check_acceptance_deadline(write: &RecordWrite, now: i64) -> Result<(), StoreError> {
@@ -711,7 +668,7 @@ impl PreparedTransition {
         if sequence.is_some_and(|expected| header.sequence != expected) {
             return Err(StoreError::Conflict);
         }
-        if let Some(sequence) = self.receipt(tx, lease)? {
+        if let Some(sequence) = self.receipt(tx, lease, limits)? {
             return Ok(CommitReceipt { sequence });
         }
         self.check_header(&header)?;
@@ -752,6 +709,7 @@ impl PreparedTransition {
         &self,
         tx: &rusqlite::Transaction<'_>,
         lease: &RunLease,
+        limits: &Limits,
     ) -> Result<Option<i64>, StoreError> {
         let old = tx
             .query_row(
@@ -766,7 +724,21 @@ impl PreparedTransition {
             }
             return Ok(Some(sequence));
         }
-        Ok(None)
+        let journaled = tx.query_row(
+            "SELECT actor,causation,payload,sequence FROM journal WHERE pure_receipt=1 AND run_id=?1 AND command_id=?2",
+            params![lease.run_id.as_str(), self.command_id()],
+            |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Vec<u8>>(2)?,row.get::<_,i64>(3)?)),
+        ).optional()?;
+        let Some((actor, causation, encoded, sequence)) = journaled else {
+            return Ok(None);
+        };
+        let payload = decode_stored(&encoded, limits)?;
+        if replay::recorded_command_digest(lease.run_id(), &actor, &causation, &payload, limits)?
+            != self.request_digest
+        {
+            return Err(StoreError::IdempotencyConflict);
+        }
+        Ok(Some(sequence))
     }
 
     fn check_header(&self, header: &RunHeader) -> Result<(), StoreError> {

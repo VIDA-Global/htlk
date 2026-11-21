@@ -7,7 +7,7 @@ records are not an additional supported wire format.
 
 ## Storage compatibility
 
-The SQLite application ID is `0x48544c4b`; the private schema version is **18**.
+The SQLite application ID is `0x48544c4b`; the private schema version is **19**.
 An empty database initializes in one immediate transaction. Versions 1–16, future
 versions, foreign application IDs, and nonempty unrecognized databases fail without
 relabeling or deletion. There is no automatic migration or legacy binding decoder.
@@ -72,7 +72,9 @@ index rebuilding does not rewrite historical projections or accepted outcomes.
 Bounded pure decision batches can include pending guards, admissions and skips from
 sibling nodes. They apply each logical decision against earlier writes in the same
 transaction, publish the run header once, and insert the per-command receipts and
-per-sequence outbox hints as bounded groups. The journal retains logical decisions;
+per-sequence outbox hints as bounded groups. Pure command receipts reconstruct the
+original digest from the indexed authoritative journal entry; other transitions
+still use the command receipt table. The journal retains logical decisions;
 inspection ordinals are allocated only for new run and record keys.
 
 `inspection_clock` allocates a transactional position just before publication.
@@ -116,7 +118,7 @@ covers caller procedures.
 The optional `postgres` feature provides native PostgreSQL tables in a dedicated
 host-selected schema. `PostgresStore::initialize` transactionally creates an empty
 recognized layout; `PostgresStore::open` requires existing state. The metadata
-application is `htlk.runtime.postgres`, layout version **5**. Initialization and
+application is `htlk.runtime.postgres`, layout version **6**. Initialization and
 opening also compare the exact embedded layout digest; a matching version label
 cannot reinterpret a different private layout. Initialization and
 multi-domain operations use an exclusive database/schema-scoped transaction

@@ -25,8 +25,10 @@ CREATE TABLE journal (
     causation TEXT NOT NULL,
     command_id TEXT,
     payload BLOB NOT NULL,
+    pure_receipt INTEGER NOT NULL DEFAULT 0 CHECK(pure_receipt IN (0,1) AND (pure_receipt=0 OR (event_type='records_committed' AND command_id IS NOT NULL))),
     PRIMARY KEY(run_id,sequence)
 ) STRICT;
+CREATE UNIQUE INDEX journal_pure_receipts ON journal(run_id,command_id) WHERE pure_receipt=1;
 CREATE TABLE outbox (
     run_id TEXT NOT NULL,
     sequence INTEGER NOT NULL,

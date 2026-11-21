@@ -1,5 +1,10 @@
 use super::*;
 
+#[cfg(feature = "postgres")]
+#[path = "../tests/support/commit_proxy.rs"]
+#[allow(dead_code)]
+mod commit_proxy;
+
 fn seed(name: &str) -> RunSeed {
     let limits = Limits::default();
     let run_id = RunId::new(name.into(), &limits).unwrap();
@@ -382,6 +387,9 @@ async fn batch_abort_contract(store: &Store) {
     );
     let counts = store.connection.read(move |db| db.query_row("SELECT (SELECT count(*) FROM inspection_record_keys WHERE run_id=?1),(SELECT count(*) FROM inspection_records v JOIN inspection_record_keys k USING(record_number) WHERE k.run_id=?1)", [run.run_id.as_str()], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))).await.unwrap();
     assert_eq!(counts, (1, 1));
+    let run = lease.run_id().clone();
+    let receipt_rows = store.connection.read(move |db| db.query_row("SELECT (SELECT count(*) FROM commands WHERE run_id=?1),(SELECT count(*) FROM journal WHERE pure_receipt=1 AND run_id=?1)", [run.as_str()], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))).await.unwrap();
+    assert_eq!(receipt_rows, (0, 2));
     assert_eq!(
         store.commit(&lease, first()).await.unwrap().sequence,
         seq + 1
@@ -870,6 +878,23 @@ fn postgres_historical_storage_contract() {
         let store=PostgresStore::initialize(settings.clone(),StoreConfig::default()).await.unwrap();
         frozen_contract(&store).await;
         batch_abort_contract(&store).await;
+        let uncertain_run = seed("pure-commit-unknown");
+        store.create_run(uncertain_run.clone()).await.unwrap();
+        let lease = store.acquire(&uncertain_run.run_id,"owner".into(),20,100).await.unwrap();
+        let seq = store.run_header(&uncertain_run.run_id).await.unwrap().sequence;
+        let proxy = commit_proxy::CommitProxy::start();
+        let mut proxied = PostgresConfig::new(proxy.connection());
+        proxied.schema.clone_from(&settings.schema);
+        let uncertain = PostgresStore::open(proxied, StoreConfig::default()).await.unwrap();
+        let first = || transition("lost-first",vec![write("value",None,1)],21);
+        let second = || transition("lost-second",vec![write("value",Some(1),2)],21);
+        proxy.arm();
+        assert_eq!(uncertain.commit_pure_batch(&lease,seq,21,80,vec![first(),second()],vec![]).await,Err(StoreError::CommitUnknown));
+        assert!(proxy.observed_commit());
+        uncertain.close().await.unwrap();
+        assert_eq!(store.commit(&lease,first()).await.unwrap().sequence,seq+1);
+        assert_eq!(store.commit(&lease,second()).await.unwrap().sequence,seq+2);
+        assert_eq!(store.journal(&uncertain_run.run_id,seq,10).await.unwrap().len(),2);
         let run=seed("rollback");
         store.create_run(run.clone()).await.unwrap();
         let lease=store.acquire(&run.run_id,"owner".into(),0,100).await.unwrap();
