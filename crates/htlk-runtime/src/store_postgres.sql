@@ -1,4 +1,4 @@
--- Native PostgreSQL layout 4. Canonical CBOR remains authoritative.
+-- Native PostgreSQL layout 5. Canonical CBOR remains authoritative.
 -- Arbitrary UTF-8 identities are BYTEA (including NUL). Generated SHA-256 keys
 -- bound B-tree entries without narrowing admitted identity sizes. The preimage
 -- registry rejects collisions before any ON CONFLICT operation can conflate keys.
@@ -80,13 +80,14 @@ CREATE TABLE outbox (
     run_id BYTEA NOT NULL,
     run_key BYTEA GENERATED ALWAYS AS (sha256(run_id)) STORED,
     sequence BIGINT NOT NULL,
-    delivered BIGINT NOT NULL DEFAULT 0 CHECK(delivered IN (0,1)),
+    span BIGINT NOT NULL DEFAULT 1 CHECK(span BETWEEN 1 AND 8 AND sequence>=span),
+    pending BIGINT NOT NULL DEFAULT 1 CHECK(pending>=0 AND pending<(1 << span::integer)),
     PRIMARY KEY(run_key,sequence),
     FOREIGN KEY(run_key,sequence) REFERENCES journal(run_key,sequence)
 );
 CREATE TRIGGER outbox_keys BEFORE INSERT OR UPDATE OF run_id ON outbox
     FOR EACH ROW EXECUTE FUNCTION htlk_check_keys('run_id');
-CREATE INDEX outbox_pending ON outbox(delivered,run_key,sequence);
+CREATE INDEX outbox_pending ON outbox(run_key,sequence) WHERE pending<>0;
 CREATE TABLE checkpoint_payloads (payload_digest TEXT PRIMARY KEY, payload BYTEA NOT NULL);
 CREATE TABLE record_heads (
     run_id BYTEA NOT NULL,

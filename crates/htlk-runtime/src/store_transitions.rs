@@ -457,22 +457,26 @@ impl SqliteStore {
     pub async fn pending_outbox(&self, page_size: usize) -> Result<Vec<OutboxNotice>, StoreError> {
         let count = self.page_size(page_size)?;
         let limits = self.config.limits.clone();
-        self.connection.call(move |db|->Result<Vec<OutboxNotice>,StoreError>{
-            let mut statement=db.prepare("SELECT run_id,sequence FROM outbox WHERE delivered=0 ORDER BY run_id,sequence LIMIT ?1")?;
+        self.connection.read(move |db|->Result<Vec<OutboxNotice>,StoreError>{
+            let mut statement=db.prepare("SELECT run_id,sequence,span,pending FROM outbox WHERE pending<>0 ORDER BY run_id,sequence LIMIT ?1")?;
             let mut rows=statement.query([count])?;
             let mut result=Vec::new();
             let mut bytes=1usize;
             while let Some(row)=rows.next()? {
-                let id=text(row,0,&limits)?;
-                let sequence:i64=row.get(1)?;
-                if sequence<1{return Err(StoreError::Corrupt)}
-                let size=cbor::encode(&Value::Array(vec![Value::Text(id.clone()),Value::Integer(sequence)]),&limits)?.len();
-                let header_growth=page_header(result.len()+1)-page_header(result.len());
-                if bytes.checked_add(size).and_then(|n|n.checked_add(header_growth)).is_none_or(|n|n>limits.max_document_bytes) {
-                    if result.is_empty(){return Err(StoreError::Invalid)}else{break}
+                let run=RunId::new(text(row,0,&limits)?,&limits).map_err(|_|StoreError::Corrupt)?;
+                let range=outbox_range(row.get(1)?,row.get(2)?,row.get(3)?)?;
+                for offset in 0..range.span {
+                    if range.pending & (1 << offset) == 0 { continue; }
+                    let sequence=range.first+offset;
+                    let size=cbor::encode(&Value::Array(vec![Value::Text(run.to_string()),Value::Integer(sequence)]),&limits)?.len();
+                    let header_growth=page_header(result.len()+1)-page_header(result.len());
+                    if bytes.checked_add(size).and_then(|n|n.checked_add(header_growth)).is_none_or(|n|n>limits.max_document_bytes) {
+                        return if result.is_empty(){Err(StoreError::Invalid)}else{Ok(result)};
+                    }
+                    bytes+=size+header_growth;
+                    result.push(OutboxNotice{run_id:run.clone(),sequence});
+                    if result.len() == count as usize { return Ok(result); }
                 }
-                bytes+=size+header_growth;
-                result.push(OutboxNotice{run_id:RunId::new(id,&limits).map_err(|_|StoreError::Corrupt)?,sequence});
             }
             Ok(result)
         }).await.map_err(StoreError::from_worker)
@@ -485,14 +489,22 @@ impl SqliteStore {
     pub async fn acknowledge(&self, notice: &OutboxNotice) -> Result<(), StoreError> {
         let notice = notice.clone();
         self.connection
-            .call(move |db| -> Result<(), StoreError> {
-                let changed = db.execute(
-                    "UPDATE outbox SET delivered=1 WHERE run_id=?1 AND sequence=?2",
+            .write_run(notice.run_id.to_string(), move |db| -> Result<(), StoreError> {
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let (end,span,pending) = tx.query_row(
+                    "SELECT sequence,span,pending FROM outbox WHERE run_id=?1 AND sequence>=?2 ORDER BY sequence LIMIT 1",
                     params![notice.run_id.as_str(), notice.sequence],
-                )?;
-                if changed != 1 {
+                    |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+                ).optional()?.ok_or(StoreError::Missing)?;
+                let range = outbox_range(end,span,pending)?;
+                if notice.sequence < range.first {
                     return Err(StoreError::Missing);
                 }
+                let next = pending & !(1 << (notice.sequence - range.first));
+                if next != pending && tx.execute("UPDATE outbox SET pending=?3 WHERE run_id=?1 AND sequence=?2", params![notice.run_id.as_str(), end, next])? != 1 {
+                    return Err(StoreError::Corrupt);
+                }
+                tx.commit()?;
                 Ok(())
             })
             .await
@@ -506,6 +518,22 @@ impl SqliteStore {
     }
 }
 
+struct OutboxRange {
+    first: i64,
+    span: i64,
+    pending: i64,
+}
+fn outbox_range(end: i64, span: i64, pending: i64) -> Result<OutboxRange, StoreError> {
+    if !(1..=8).contains(&span) || end < span || pending < 0 || pending >= 1 << span {
+        return Err(StoreError::Corrupt);
+    }
+    Ok(OutboxRange {
+        first: end - span + 1,
+        span,
+        pending,
+    })
+}
+
 // At most eight commands. Parameter 1 is shared by every row; values never
 // enter the SQL string. The journal retains every sequence and both indexes
 // retain individually addressable receipts/acknowledgements.
@@ -517,24 +545,24 @@ fn insert_batch_notices(
     use std::fmt::Write as _;
     let mut commands =
         String::from("INSERT INTO commands(run_id,command_id,request_digest,sequence) VALUES");
-    let mut outbox = String::from("INSERT INTO outbox(run_id,sequence) VALUES");
     let run_id = run.as_str();
     let mut command_params: Vec<&dyn rusqlite::ToSql> = vec![&run_id];
-    let mut outbox_params = command_params.clone();
     for (i, (id, digest, sequence)) in receipts.iter().enumerate() {
         if i > 0 {
             commands.push(',');
-            outbox.push(',');
         }
         let start = i * 3 + 2;
         write!(commands, "(?1,?{start},?{},?{})", start + 1, start + 2)
             .expect("infallible String formatting");
-        write!(outbox, "(?1,?{})", i + 2).expect("infallible String formatting");
         command_params.extend([id as &dyn rusqlite::ToSql, digest, sequence]);
-        outbox_params.push(sequence);
     }
-    if tx.execute(&commands, command_params.as_slice())? != receipts.len()
-        || tx.execute(&outbox, outbox_params.as_slice())? != receipts.len()
+    let span = receipts.len();
+    let end = receipts.last().ok_or(StoreError::Invalid)?.2;
+    if tx.execute(&commands, command_params.as_slice())? != span
+        || tx.execute(
+            "INSERT INTO outbox(run_id,sequence,span,pending) VALUES(?1,?2,?3,?4)",
+            params![run_id, end, span, (1_i64 << span) - 1],
+        )? != 1
     {
         return Err(StoreError::Database);
     }

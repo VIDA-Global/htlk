@@ -30,11 +30,12 @@ CREATE TABLE journal (
 CREATE TABLE outbox (
     run_id TEXT NOT NULL,
     sequence INTEGER NOT NULL,
-    delivered INTEGER NOT NULL DEFAULT 0 CHECK(delivered IN (0,1)),
+    span INTEGER NOT NULL DEFAULT 1 CHECK(span BETWEEN 1 AND 8 AND sequence>=span),
+    pending INTEGER NOT NULL DEFAULT 1 CHECK(pending>=0 AND pending<(1 << span)),
     PRIMARY KEY(run_id,sequence),
     FOREIGN KEY(run_id,sequence) REFERENCES journal(run_id,sequence)
 ) STRICT;
-CREATE INDEX outbox_pending ON outbox(delivered,run_id,sequence);
+CREATE INDEX outbox_pending ON outbox(run_id,sequence) WHERE pending<>0;
 -- Each family retains its typed runtime record schema; these rows are not a
 -- second graph. Immutable/final records cannot be revised by normal transitions.
 CREATE TABLE checkpoint_payloads (

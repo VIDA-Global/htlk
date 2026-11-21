@@ -408,6 +408,26 @@ async fn batch_abort_contract(store: &Store) {
             .collect::<Vec<_>>(),
         [seq + 1, seq + 2]
     );
+    let run = lease.run_id().clone();
+    assert_eq!(
+        store
+            .connection
+            .read(move |db| db.query_row(
+                "SELECT count(*) FROM outbox WHERE run_id=?1 AND span=2 AND pending=3",
+                [run.as_str()],
+                |row| row.get::<_, i64>(0)
+            ))
+            .await
+            .unwrap(),
+        1
+    );
+    for notice in pending {
+        store.acknowledge(&notice).await.unwrap();
+    }
+    assert_eq!(
+        store.pending_outbox(1).await.unwrap(),
+        vec![notices[0].clone()]
+    );
     store.acknowledge(&notices[1]).await.unwrap();
     store.acknowledge(&notices[1]).await.unwrap();
     assert!(
@@ -428,6 +448,12 @@ async fn batch_abort_contract(store: &Store) {
         store.inspection_position().await.unwrap(),
         *after.position()
     );
+    store.acknowledge(&notices[0]).await.unwrap();
+    store.acknowledge(&notices[1]).await.unwrap();
+    assert!(store.pending_outbox(100).await.unwrap().is_empty());
+    let mut unknown = notices[1].clone();
+    unknown.sequence += 1;
+    assert_eq!(store.acknowledge(&unknown).await, Err(StoreError::Missing));
 }
 
 #[cfg(feature = "sqlite")]

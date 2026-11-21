@@ -7,7 +7,7 @@ records are not an additional supported wire format.
 
 ## Storage compatibility
 
-The SQLite application ID is `0x48544c4b`; the private schema version is **17**.
+The SQLite application ID is `0x48544c4b`; the private schema version is **18**.
 An empty database initializes in one immediate transaction. Versions 1–16, future
 versions, foreign application IDs, and nonempty unrecognized databases fail without
 relabeling or deletion. There is no automatic migration or legacy binding decoder.
@@ -116,7 +116,7 @@ covers caller procedures.
 The optional `postgres` feature provides native PostgreSQL tables in a dedicated
 host-selected schema. `PostgresStore::initialize` transactionally creates an empty
 recognized layout; `PostgresStore::open` requires existing state. The metadata
-application is `htlk.runtime.postgres`, layout version **4**. Initialization and
+application is `htlk.runtime.postgres`, layout version **5**. Initialization and
 opening also compare the exact embedded layout digest; a matching version label
 cannot reinterpret a different private layout. Initialization and
 multi-domain operations use an exclusive database/schema-scoped transaction
@@ -278,7 +278,8 @@ Replay enforces these restrictions and checks time, authority, finality, command
 uniqueness, and root changes. Discard partial reconstruction after any error.
 Pages and aggregate retained reconstruction bytes are bounded.
 
-Each journal insertion adds an outbox notice in the same transaction. Hints
+Each journal insertion adds an outbox notice in the same transaction. A pure
+batch stores one range with an acknowledgment bit per journal sequence. Hints
 redeliver until idempotent acknowledgement. They do not authorize acceptance or make
 external effects transactional. Execution recovers from authoritative records,
 not from assuming a notification was delivered exactly once.
