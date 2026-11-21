@@ -69,6 +69,12 @@ per physical commit. These read indexes are not a replacement recovery journal.
 They never contain artifact value blobs or become retention roots. Artifact producer
 index rebuilding does not rewrite historical projections or accepted outcomes.
 
+Bounded pure decision batches can include pending guards, admissions and skips from
+sibling nodes. They apply each logical decision against earlier writes in the same
+transaction, publish the run header once, and insert the per-command receipts and
+per-sequence outbox hints as bounded groups. The journal retains logical decisions;
+inspection ordinals are allocated only for new run and record keys.
+
 `inspection_clock` allocates a transactional position just before publication.
 Repeated changes to one record in a transaction project only its final version;
 the final per-run journal sequence bounds all its feed entries. PostgreSQL accumulates

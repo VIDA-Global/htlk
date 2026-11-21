@@ -302,3 +302,25 @@ less write traffic; they do not establish a throughput improvement. Repeat with
 the intended workload and storage placement before choosing a batching limit.
 The final PostgreSQL result includes the advisory-lock fix that prevents
 receipt-only retries from generating WAL under synchronous replication.
+
+### Guard-heavy recorded workflow
+
+A paired offline replay of retail Task 104 (ALMA graph revision 060) used the
+same NLT host, Linux amd64 container, recorded provider traffic, and
+`pure_batch_steps=8` for both builds. The control used HTLK `e6fa8c1`; the
+treatment used `6843653` with sibling batching, inspection-key reuse, and grouped
+run-header, receipt and outbox writes.
+
+| Measurement | Control | Treatment |
+| --- | ---: | ---: |
+| Cumulative SQLite WAL bytes | 762,584,832 | 559,125,304 |
+| WAL sync calls | 5,127 | 3,225 |
+| Published inspection positions | 4,704 | 2,900 |
+| Retained guard records | 4,799 | 4,799 |
+| Wall time | 73.10 s | 60.09 s |
+
+Both runs matched 24 model calls, 19 retail calls, 11 customer waits and the
+final report. WAL traffic fell 26.7%, and inspection positions fell 38.4%.
+The WAL counter measures application writes to the WAL file, excluding database
+checkpoint and device writes. These are single paired trials of one SQLite
+workflow, not a PostgreSQL capacity estimate.

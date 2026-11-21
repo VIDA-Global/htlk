@@ -14,12 +14,19 @@ User-visible changes and compatibility boundaries are recorded here, following
   original graph attempt under a current fence, without another provider call.
 - Opt-in bounded pure-eval batching. Logical decisions remain in the journal;
   one inspection pin represents the batch's committed state.
+- Opt-in batching also groups ready guards, admissions and skips across sibling
+  nodes without grouping external operations into those transactions.
 - Per-connection write-operation and affected-row counters for performance campaigns.
 - Repeatable release-mode performance campaigns for durable SQLite and PostgreSQL,
   with raw timing samples and correctness checks under load.
 
 ### Changed
 
+- Pure decision batches update the run sequence once and insert command receipts
+  and outbox notices together while retaining one receipt and notice per decision.
+- Inspection publication reuses existing run and record ordinals without
+  attempting another insertion, and publishes only the final record version per
+  physical commit.
 - PostgreSQL per-run advisory locks keep receipt-only retries from generating WAL
   or waiting for a new synchronous replication acknowledgment.
 - Current and historical records share immutable checkpoint payloads, and

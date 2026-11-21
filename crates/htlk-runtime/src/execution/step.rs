@@ -32,6 +32,7 @@ use std::{collections::BTreeMap, sync::Arc};
 #[path = "step_tests.rs"]
 mod tests;
 
+#[derive(Clone)]
 pub(super) struct ScopeState {
     pub record: StoredRecord,
     pub executable: Arc<crate::VerifiedExecutable<'static>>,
@@ -235,7 +236,7 @@ async fn tick_observed(
             return Ok(Progress::Changed);
         }
         let definitions = scope.definition.fields().nodes.clone();
-        for definition in &definitions {
+        for (index, definition) in definitions.iter().enumerate() {
             let record = scope.nodes.get(definition.id()).ok_or_else(err)?;
             if record.final_record {
                 continue;
@@ -260,13 +261,16 @@ async fn tick_observed(
             if working::with(|set| set.waiting(&record.key.id)) == Some(true) {
                 continue;
             }
-            if pure_batch_steps > 1 && matches!(definition.fields().operation, Operation::Eval(_)) {
-                match batch_eval(
+            let pending = InvocationCheckpoint::parse(record, &runtime.config.limits)?.is_pending();
+            if pure_batch_steps > 1
+                && (pending || matches!(definition.fields().operation, Operation::Eval(_)))
+            {
+                match batch_local(
                     &runtime,
                     &lease,
                     &scope,
-                    definition,
-                    record,
+                    (&definitions, index),
+                    now,
                     header.sequence,
                     pure_batch_steps,
                 )
@@ -277,12 +281,11 @@ async fn tick_observed(
                     None => {} // An oversized proposal uses the ordinary single-step path.
                 }
             }
-            let changed =
-                if InvocationCheckpoint::parse(record, &runtime.config.limits)?.is_pending() {
-                    admit(&runtime, &lease, &scope, definition, record).await?
-                } else {
-                    operate(&runtime, &lease, &scope, definition, record).await?
-                };
+            let changed = if pending {
+                admit(&runtime, &lease, &scope, definition, record).await?
+            } else {
+                operate(&runtime, &lease, &scope, definition, record).await?
+            };
             if changed {
                 return Ok(Progress::Changed);
             }
@@ -420,34 +423,55 @@ impl PureDraft {
     }
 }
 
-async fn batch_eval(
+async fn batch_local(
     runtime: &Arc<Runtime>,
     lease: &RunLease,
     scope: &ScopeState,
-    node: &Node,
-    record: &StoredRecord,
+    (nodes, first): (&[Node], usize),
+    now: i64,
     sequence: i64,
     limit: usize,
 ) -> Result<Option<bool>, RuntimeError> {
     let mut plan = Box::pin(PURE_DRAFT.scope(Default::default(), async {
-        let mut record = record.clone();
-        for _ in 0..limit {
-            let pending =
-                InvocationCheckpoint::parse(&record, &runtime.config.limits)?.is_pending();
-            let changed = if pending {
-                admit(runtime, lease, scope, node, &record).await?
+        let mut scope = scope.clone();
+        'batch: for step in 0..limit {
+            // The unbatched reducer starts its scan again after each decision.
+            // Later guards must observe an earlier sibling's proposed disposition.
+            let candidates = if step == 0 {
+                &nodes[first..=first]
             } else {
-                operate(runtime, lease, scope, node, &record).await?
+                nodes
             };
-            if !changed || !pending {
-                break;
-            }
-            if let Some(proposed) = PURE_DRAFT.with(|draft| draft.borrow().record(&record.key)) {
-                record = proposed;
+            for node in candidates {
+                let record = scope.nodes.get(node.id()).ok_or_else(err)?;
                 if record.final_record {
-                    break;
+                    continue;
+                }
+                if due(&record.payload, now)? {
+                    break 'batch;
+                }
+                // A draft can change dependencies, so use the committed waiting
+                // index only before the first decision (checked by the caller).
+                let pending =
+                    InvocationCheckpoint::parse(record, &runtime.config.limits)?.is_pending();
+                if !pending {
+                    if matches!(node.fields().operation, Operation::Eval(_)) {
+                        operate(runtime, lease, &scope, node, record).await?;
+                    }
+                    // Flush before any external/control operation and before
+                    // another decision could read newly produced artifact bytes.
+                    break 'batch;
+                }
+                if admit(runtime, lease, &scope, node, record).await? {
+                    if let Some(proposed) =
+                        PURE_DRAFT.with(|draft| draft.borrow().record(&record.key))
+                    {
+                        scope.nodes.insert(node.id().clone(), proposed);
+                    }
+                    continue 'batch;
                 }
             }
+            break;
         }
         Ok::<_, RuntimeError>(())
     }));

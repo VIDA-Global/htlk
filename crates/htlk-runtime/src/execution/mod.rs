@@ -69,7 +69,8 @@ pub struct ExecutionConfig {
     pub lease_ms: i64,
     /// Scheduling/recovery polling interval.
     pub poll_interval: Duration,
-    /// Maximum logical decisions committed together per pure eval invocation.
+    /// Maximum ready local decisions committed together within a scope.
+    /// Includes sibling guards, admission, skips and pure eval completion.
     /// One preserves independently pinnable transitions; two through eight opt in.
     pub pure_batch_steps: usize,
 }
