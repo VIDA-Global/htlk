@@ -69,7 +69,7 @@ def distribution(items):
     return {f"p{p}": ordered[math.ceil(p / 100 * len(ordered)) - 1] for p in (50, 95, 99)}
 
 
-def read_trial(path, spec):
+def read_csv(path):
     metadata, samples, runs = {}, defaultdict(list), []
     with path.open(newline="") as stream:
         for kind, *fields in csv.reader(stream):
@@ -82,6 +82,11 @@ def read_trial(path, spec):
                 runs.append(tuple(map(int, fields)))
             else:
                 raise ValueError(f"unrecognized output row: {kind}")
+    return metadata, samples, runs
+
+
+def read_trial(path, spec):
+    metadata, samples, runs = read_csv(path)
     if len(runs) != spec["runs"] or len({row[0] for row in runs}) != len(runs):
         raise ValueError("incorrect benchmark sample count")
     if not runs:

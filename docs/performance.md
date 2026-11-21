@@ -89,6 +89,66 @@ include lock waits during timed statements but do not capture all client/server
 round trips. For runtime CPU attribution, attach a sampling profiler to the release
 driver during a long trial and inspect the database process separately.
 
+## PostgreSQL horizontal capacity
+
+Use [the capacity runner](../tools/postgres_capacity.py) on a dedicated,
+disposable PostgreSQL deployment. Keep production-like storage, network latency,
+and durability settings. Build the release example as above and start with one
+primary, then repeat against separate primaries if shared resources become the
+limit. For example, with `HTLK_PERF_POSTGRES_URL` set as above:
+
+```console
+python3 tools/postgres_capacity.py --output target/capacity-balanced --sizes 1,2,4 --rates 2,4,8 --seconds 60 --trials 3 --p95-ms 1000 --parked-runs 24 --stats-container htlk-perf
+```
+
+- `shared`: one driver and execution engine, with the other processes running
+  independent engines on the same schema. Admissions originate in the driver;
+  the other engines discover work through normal reconciliation.
+- `partitioned`: one driver and execution engine per schema on a single primary.
+- `distributed`: the same independent schemas placed round-robin across separate
+  primaries. Set one DSN environment variable per primary and pass each name with
+  `--postgres-url-env`. Add `--topology distributed` and use sizes of at least two.
+  If collecting stats, pass one `--stats-container` or `--stats-service` per DSN in
+  the same order. A stats service is a libpq service pointing at the same database,
+  with privileges to see benchmark sessions' activity (such as `pg_read_all_stats`).
+
+The default sweep compares `shared` and `partitioned`. Run again with
+`--hot-share 70` and a new output directory to route 70% of arrivals to one
+partition, without changing the total arrival rate or graph mix. Tune `--mix-nodes`,
+`--payload-bytes`, `--readers`, and `--parked-runs` to approximate your workload.
+Supply the target `--p95-ms` and increase the offer window near saturation. With
+parked runs, the offer and drain windows together are limited to 180 seconds to
+leave room for setup and reply verification before saved deadlines. The example
+uses synthetic workflows and runs all HTLK processes on the load-generator host.
+
+`capacity.json` gives the highest **tested** aggregate arrival rate at which every
+repeat, and every partition in each repeat, passed. A pass requires p95 time from
+planned arrival to observed completion within budget, midpoint-to-end backlog
+growth within `--max-backlog-growth`, and p95 submission lag within
+`--max-submit-lag-ms`. Inspect raw samples when the generator falls behind, the
+rate grid is coarse, or a cold partition has too few samples for a meaningful
+tail estimate. A timed-out or otherwise invalid trial is `failed`; a verified
+trial that misses a target is `over_slo`. The runner returns nonzero for failed
+trials and still writes the report.
+
+Each trial retains process CSVs and a `result.json` with per-partition and
+aggregate goodput during the offer, backlog, drain time, and admission round-trip
+latency (client-observed; includes runtime overhead). Optional PostgreSQL
+diagnostics add sampled inspection-clock and other waits plus counter deltas
+around offer and drain. Activity samples are point-in-time counts, not durations;
+short waits can be missed. Counters can lag, WAL bytes cover the whole primary,
+and database I/O timing requires `track_io_timing`. Compare the same profiling
+settings across trials.
+
+The `publication` totals aggregate acknowledged PostgreSQL publications across
+all execution processes. Acquisition time includes the lock query round trip;
+hold time starts when that query returns and ends at the guarded commit response.
+These are client-observed averages, not exact server-side lock intervals.
+Projection statement counts include the lock query but exclude COMMIT and driver
+prepares. Setup and output/replay verification sit outside the measured workload.
+The runner leaves its generated `htlk_perf_cap_*` schemas in the disposable
+databases; remove those databases when finished.
+
 ## Local baseline: `a3c751a`, 2026-11-19
 
 Release profile, Rust 1.98.0, Apple M4 Max (14 cores, 36 GiB), macOS 26.6.2.
@@ -375,3 +435,26 @@ mixed parked-reply p95 moved from 254 to 188 ms on PostgreSQL and from 15.0 to
 16.0 ms on SQLite. Counters include setup, parked runs, and verification;
 PostgreSQL statement/commit counts also include readers. They measure workload
 cost, not an isolated scheduler/control call count or a production capacity limit.
+
+## PostgreSQL inspection publication batching
+
+The local A/B used PostgreSQL 18.6 on Docker Desktop, with two HTLK processes,
+four inspection readers, four parked runs, and an eight-node chain/fan-out mix.
+Both builds collected publication timings; the control published each record
+individually and the treatment used ordered batches. `pure_batch_steps` stayed
+at 1. The two-schema case routed 70% of arrivals to one store. At 4 offered
+runs/s, three 20-second offers of each configuration gave these medians:
+
+| Topology | Projection calls per commit | Mean acquisition query | Mean hold through commit | Completions/s during offer | Completion p95 | Trials passing 1.5 s p95 and backlog target |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| One shared schema | 12.21 → 8.00 | 0.35 → 0.33 ms | 3.51 → 2.77 ms | 3.55 → 3.65 | 6.33 → 5.37 s | 0/3 → 0/3 |
+| Two schemas, 70% hot | 12.21 → 8.00 | 0.25 → 0.24 ms | 3.88 → 2.55 ms | 3.60 → 3.90 | 5.86 → 1.01 s | 1/3 → 3/3 |
+
+The bulk path reduced measured time after acquiring the clock in both layouts;
+acquisition query time changed little. The shared schema still missed the
+latency target. A separate 60-second pair on the two-schema layout sustained
+3.97 completions/s with either build. Aggregate p95 fell from 1.95 to 1.08 s;
+the hot schema's p95 fell from 2.55 to 1.14 s. Mean hold time fell from 3.82 to
+2.58 ms, and treatment backlog stayed at two runs from midpoint to end. Short
+follow-up offers at 5 and 6 runs/s on this layout missed the latency target on
+both builds. Use a production-like rate sweep before setting a capacity limit.

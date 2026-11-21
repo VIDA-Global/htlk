@@ -601,9 +601,25 @@ impl<'a> PageBudget<'a> {
 pub(crate) struct ProjectionBatch {
     events: Vec<(String, Vec<RecordKey>)>,
     bytes: usize,
+    #[cfg(feature = "postgres")]
+    publication: Option<(std::time::Instant, std::time::Instant, u64)>,
 }
 
 impl ProjectionBatch {
+    #[cfg(feature = "postgres")]
+    pub(crate) fn publication_sample(
+        &mut self,
+        statements: u64,
+    ) -> Option<StorePublicationMetrics> {
+        let (started, locked, before) = self.publication.take()?;
+        let ns = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        Some(StorePublicationMetrics {
+            commits: 1,
+            acquire_ns: ns(locked.duration_since(started)),
+            hold_ns: ns(locked.elapsed()),
+            statements: statements.wrapping_sub(before),
+        })
+    }
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) fn mark(&self) -> (usize, usize) {
         (self.events.len(), self.bytes)
@@ -680,7 +696,13 @@ pub(crate) fn flush_projection(db: &rusqlite::Connection) -> rusqlite::Result<()
         } else {
             sql
         };
+        #[cfg(feature = "postgres")]
+        let timing = db.publication_clock();
         let previous: i64 = db.query_row(sql, [], |r| r.get(0))?;
+        #[cfg(feature = "postgres")]
+        if let Some((started, before)) = timing {
+            queue.borrow_mut().publication = Some((started, std::time::Instant::now(), before));
+        }
         let position = previous.checked_add(1).ok_or(rusqlite::Error::Invalid)?;
         db.execute(
             "UPDATE inspection_clock SET position=?1 WHERE singleton=1",
@@ -735,6 +757,11 @@ pub(crate) fn flush_projection(db: &rusqlite::Connection) -> rusqlite::Result<()
             "INSERT INTO inspection_changes(position,run_number,sequence) VALUES(?1,?2,?3)",
             params![position, run_number, sequence],
         )?;
+        #[cfg(feature = "postgres")]
+        if db.is_postgres() {
+            db.project_postgres_records(&run, position, run_number, sequence, &keys)?;
+            continue;
+        }
         for RecordKey { family, id } in keys {
             let family = family.as_str();
             let existing = db.query_row("SELECT record_number FROM inspection_record_keys WHERE run_id=?1 AND family=?2 AND record_id=?3",params![run,family,id],|r| r.get::<_, i64>(0)).optional()?;

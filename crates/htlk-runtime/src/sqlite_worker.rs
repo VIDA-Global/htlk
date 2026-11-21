@@ -5,7 +5,7 @@
 //! Database transactions, not this queue, arbitrate independent store connections.
 //! The bounded queue admits at most 256 waiting operations per shared handle.
 
-use crate::store::StoreWriteMetrics;
+use crate::store::{StorePublicationMetrics, StoreWriteMetrics};
 use crate::store_db as rusqlite;
 use std::{
     path::Path,
@@ -36,6 +36,15 @@ enum Message {
 pub(crate) struct Connection {
     sender: mpsc::Sender<Message>,
     writes: Arc<WriteMetrics>,
+    publications: Arc<PublicationMetrics>,
+}
+
+#[derive(Default)]
+struct PublicationMetrics {
+    commits: AtomicU64,
+    acquire_ns: AtomicU64,
+    hold_ns: AtomicU64,
+    statements: AtomicU64,
 }
 
 #[derive(Default)]
@@ -96,6 +105,7 @@ impl Connection {
         Ok(Self {
             sender,
             writes: Arc::default(),
+            publications: Arc::default(),
         })
     }
 
@@ -103,6 +113,15 @@ impl Connection {
         StoreWriteMetrics {
             operations: self.writes.operations.load(Ordering::Relaxed),
             rows: self.writes.rows.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn publication_metrics(&self) -> StorePublicationMetrics {
+        StorePublicationMetrics {
+            commits: self.publications.commits.load(Ordering::Relaxed),
+            acquire_ns: self.publications.acquire_ns.load(Ordering::Relaxed),
+            hold_ns: self.publications.hold_ns.load(Ordering::Relaxed),
+            statements: self.publications.statements.load(Ordering::Relaxed),
         }
     }
 
@@ -154,6 +173,8 @@ impl Connection {
     {
         let (reply, result) = oneshot::channel();
         let writes = self.writes.clone();
+        #[cfg(feature = "postgres")]
+        let publications = self.publications.clone();
         self.sender
             .send(Message::Call(Box::new(move |db| {
                 let outcome = match db.begin_operation(mode) {
@@ -164,6 +185,19 @@ impl Connection {
                         match db.finish_operation(outcome.is_ok()) {
                             Err(error) => Err(Error::Database(error)),
                             Ok(()) => {
+                                #[cfg(feature = "postgres")]
+                                if let Some(sample) = db.publication_sample() {
+                                    publications.commits.fetch_add(1, Ordering::Relaxed);
+                                    publications
+                                        .acquire_ns
+                                        .fetch_add(sample.acquire_ns, Ordering::Relaxed);
+                                    publications
+                                        .hold_ns
+                                        .fetch_add(sample.hold_ns, Ordering::Relaxed);
+                                    publications
+                                        .statements
+                                        .fetch_add(sample.statements, Ordering::Relaxed);
+                                }
                                 let rows = db.affected_rows().saturating_sub(before);
                                 if outcome.is_ok() && rows > 0 {
                                     writes.operations.fetch_add(1, Ordering::Relaxed);

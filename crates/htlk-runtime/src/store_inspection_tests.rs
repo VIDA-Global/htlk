@@ -861,6 +861,96 @@ fn sqlite_byte_bounded_pages_make_progress_without_losing_rows() {
 }
 
 #[cfg(feature = "postgres")]
+async fn postgres_projection_batches(store: &Store) {
+    let run = seed("bulk-projection");
+    store.create_run(run.clone()).await.unwrap();
+    let lease = store
+        .acquire(&run.run_id, "owner".into(), 20, 100)
+        .await
+        .unwrap();
+    let existing = "key-032\0é";
+    store
+        .commit(
+            &lease,
+            transition("initial-key", vec![write(existing, None, 1)], 21),
+        )
+        .await
+        .unwrap();
+    let pinned = store
+        .open_inspection_snapshot(&run.run_id, None)
+        .await
+        .unwrap();
+    let mut ids: Vec<_> = (0..130).map(|n| format!("key-{n:03}")).collect();
+    ids[32] = existing.into();
+    let writes = ids
+        .iter()
+        .rev()
+        .map(|id| write(id, (id == existing).then_some(1), 2))
+        .collect();
+    let offer = store.publication_metrics();
+    store
+        .commit(&lease, transition("wide-projection", writes, 22))
+        .await
+        .unwrap();
+    let measured = store.publication_metrics();
+    assert_eq!(measured.commits - offer.commits, 1);
+    assert!(measured.statements - offer.statements < 20);
+    let now = store
+        .open_inspection_snapshot(&run.run_id, None)
+        .await
+        .unwrap();
+    assert_eq!(now.position().number(), pinned.position().number() + 1);
+    assert_eq!(
+        store
+            .inspection_record(&pinned, &write(existing, None, 0).key)
+            .await
+            .unwrap()
+            .payload,
+        Value::Integer(1)
+    );
+    assert_eq!(
+        store
+            .inspection_record(&pinned, &write(&ids[129], None, 0).key)
+            .await,
+        Err(StoreError::Missing)
+    );
+    let mut cursor = store
+        .inspection_changes(0, Some(pinned.position()), 100)
+        .await
+        .unwrap()
+        .last()
+        .unwrap()
+        .cursor;
+    let mut projected = Vec::new();
+    let mut headers = 0;
+    loop {
+        let page = store
+            .inspection_changes(cursor, Some(now.position()), 17)
+            .await
+            .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        for change in page {
+            assert!(change.cursor > cursor);
+            cursor = change.cursor;
+            assert_eq!(change.position, *now.position());
+            assert_eq!(change.sequence, now.header().sequence);
+            assert_eq!(change.run_id, run.run_id);
+            match change.key {
+                None => {
+                    assert!(projected.is_empty());
+                    headers += 1;
+                }
+                Some(key) => projected.push(key.id),
+            }
+        }
+    }
+    assert_eq!(headers, 1);
+    assert_eq!(projected, ids);
+}
+
+#[cfg(feature = "postgres")]
 #[test]
 fn postgres_historical_storage_contract() {
     let url = std::env::var("HTLK_TEST_POSTGRES_URL")
@@ -878,6 +968,7 @@ fn postgres_historical_storage_contract() {
         let store=PostgresStore::initialize(settings.clone(),StoreConfig::default()).await.unwrap();
         frozen_contract(&store).await;
         batch_abort_contract(&store).await;
+        postgres_projection_batches(&store).await;
         let uncertain_run = seed("pure-commit-unknown");
         store.create_run(uncertain_run.clone()).await.unwrap();
         let lease = store.acquire(&uncertain_run.run_id,"owner".into(),20,100).await.unwrap();
@@ -900,7 +991,9 @@ fn postgres_historical_storage_contract() {
         let lease=store.acquire(&run.run_id,"owner".into(),0,100).await.unwrap();
         let original=store.open_inspection_snapshot(&run.run_id,None).await.unwrap();
         store.connection.call(|db| db.execute_batch("CREATE FUNCTION reject_inspection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected projection failure'; END $$; CREATE TRIGGER reject_projection BEFORE INSERT ON inspection_changes FOR EACH ROW WHEN (new.record_number IS NOT NULL) EXECUTE FUNCTION reject_inspection()")).await.unwrap();
+        let before_failed_publication=store.publication_metrics();
         assert_eq!(store.commit(&lease,transition("failed",vec![write("a",None,1)],1)).await,Err(StoreError::Database));
+        assert_eq!(store.publication_metrics(),before_failed_publication);
         assert_eq!(store.open_inspection_snapshot(&run.run_id,None).await.unwrap(),original);
         assert_eq!(store.inspection_position().await.unwrap(),*original.position());
         assert_eq!(store.record(&run.run_id,&write("a",None,0).key).await,Err(StoreError::Missing));
