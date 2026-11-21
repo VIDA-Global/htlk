@@ -22,8 +22,8 @@ use htlk_executable::{
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc,
-        atomic::{AtomicI64, AtomicUsize, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -35,14 +35,23 @@ impl CoordinatorClock for Clock {
         Ok(self.0.load(Ordering::SeqCst))
     }
 }
+type PolicyHook = Mutex<Option<Box<dyn FnOnce() + Send>>>;
+
+fn run_hook(hook: &PolicyHook) {
+    let hook = hook.lock().unwrap().take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 struct Policy {
     clock: Arc<Clock>,
     mode: AtomicUsize,
     deny_mode: AtomicUsize,
     reply_at: AtomicI64,
     approval_at: AtomicI64,
-    release: Arc<std::sync::atomic::AtomicBool>,
-    release_on_extend: std::sync::atomic::AtomicBool,
+    on_reply_labels: PolicyHook,
+    on_mcp_policy: PolicyHook,
     read_at: AtomicI64,
 }
 impl RuntimePolicy for Policy {
@@ -52,11 +61,6 @@ impl RuntimePolicy for Policy {
             if at != 0 {
                 self.clock.0.store(at, Ordering::SeqCst);
             }
-        }
-        if matches!(action, Authorization::ExtendRun { .. })
-            && self.release_on_extend.load(Ordering::SeqCst)
-        {
-            self.release.store(true, Ordering::SeqCst);
         }
         Ok(())
     }
@@ -76,6 +80,7 @@ impl RuntimePolicy for Policy {
         _: WaitId,
         _: &Value,
     ) -> Result<SecurityLabels, RuntimeFailure> {
+        run_hook(&self.on_reply_labels);
         let at = self.reply_at.load(Ordering::SeqCst);
         if at != 0 {
             self.clock.0.store(at, Ordering::SeqCst);
@@ -101,6 +106,7 @@ impl RuntimePolicy for Policy {
         Ok(SecurityLabels::default())
     }
     fn mcp_policy(&self, _: &HostContext, _: &McpBinding) -> Result<McpPolicy, RuntimeFailure> {
+        run_hook(&self.on_mcp_policy);
         let mode = self.mode.load(Ordering::SeqCst);
         Ok(McpPolicy {
             replay_safe: true,
@@ -114,8 +120,8 @@ struct Adapter {
     descriptors: BTreeMap<Digest, JsonDocument>,
     raw: Vec<u8>,
     calls: AtomicUsize,
-    hold: std::sync::atomic::AtomicBool,
-    release: Arc<std::sync::atomic::AtomicBool>,
+    hold: AtomicBool,
+    release: AtomicBool,
 }
 impl McpAdapter for Adapter {
     fn descriptor<'a>(
@@ -152,7 +158,7 @@ struct Harness {
 }
 impl Harness {
     async fn new(source: &str, steps: u64, raw: Vec<u8>) -> Self {
-        let (base, mut registry) = support::native_compiler_with_timeouts(10000, 1000);
+        let (base, mut registry) = support::native_compiler_with_timeouts(10000, 10000);
         let mut config = base.config().clone();
         let mut fields = config.policy.fields().clone();
         fields.evaluator_limits.max_steps = steps;
@@ -162,7 +168,6 @@ impl Harness {
         let graph = compiler
             .compile_source(source, &support::catalogs())
             .unwrap();
-        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let adapter = Arc::new(Adapter {
             descriptors: graph
                 .canonical_document
@@ -178,8 +183,8 @@ impl Harness {
                 .collect(),
             raw,
             calls: AtomicUsize::new(0),
-            hold: std::sync::atomic::AtomicBool::new(false),
-            release: release.clone(),
+            hold: AtomicBool::new(false),
+            release: AtomicBool::new(false),
         });
         let clock = Arc::new(Clock(AtomicI64::new(1000)));
         let policy = Arc::new(Policy {
@@ -188,8 +193,8 @@ impl Harness {
             deny_mode: AtomicUsize::new(usize::MAX),
             reply_at: AtomicI64::new(0),
             approval_at: AtomicI64::new(0),
-            release,
-            release_on_extend: std::sync::atomic::AtomicBool::new(false),
+            on_reply_labels: Mutex::default(),
+            on_mcp_policy: Mutex::default(),
             read_at: AtomicI64::new(0),
         });
         let store = SqliteStore::in_memory(StoreConfig::default())
@@ -436,7 +441,7 @@ fn mounted_waits_are_blocked_and_expired_atomic_closures_do_not_install() {
 }
 
 #[test]
-fn response_arriving_during_extension_is_durable_and_never_redispatched() {
+fn response_accounted_during_extension_is_durable_and_never_redispatched() {
     use htlk::compiler::{JoinEdge, JoinEndpoint, JoinOperand, JoinOutput, JoinSpec};
     use htlk::runtime::execution::{CloseWait, ExtensionRequest};
     actix::System::new().block_on(async {
@@ -449,17 +454,80 @@ fn response_arriving_during_extension_is_durable_and_never_redispatched() {
         let composed=h.compiler.join_graphs(&old.canonical_document,&added.canonical_document,&JoinSpec{id:"test.race_join".into(),left_alias:"old".into(),right_alias:"added".into(),edges:vec![JoinEdge{id:"value".into(),from:endpoint(JoinOperand::Left),to:endpoint(JoinOperand::Right)}],inputs:vec![],outputs:vec![JoinOutput{name:"value".into(),from:endpoint(JoinOperand::Right)}]},&support::catalogs()).unwrap();
         h.runtime.register_graph(&h.caller,&composed.executable_bytes,&[]).await.unwrap();
         let engine=h.launch();let run=h.runtime.start_run(&h.caller,h.fingerprint,&BTreeMap::new(),"start",Some(&htlk_executable::ExecutionLimits::new().with_max_mcp_calls(1).unwrap())).await.unwrap().run_id;
-        // The coordinator serializes graph decisions while the worker holds the
-        // MCP future, so create the planning wait before entering that future.
-        let mut waits=Vec::new();
-        for _ in 0..2000 { waits=h.store.records(&run,RecordFamily::Wait,None,100).await.unwrap();if !waits.is_empty()&&h.adapter.calls.load(Ordering::SeqCst)==1{break;}actix::clock::sleep(Duration::from_millis(2)).await; }
-        let wait=waits.first().expect("planning wait must precede dispatch");
-        h.policy.release_on_extend.store(true,Ordering::SeqCst);
-        h.runtime.extend_run(&h.caller,&run,&ExtensionRequest{expected_fingerprint:h.fingerprint,composed_fingerprint:composed.fingerprint,inputs:BTreeMap::new(),close_wait:Some(CloseWait{wait_id:wait.key.id.parse().unwrap(),value:Value::Bool(true),idempotency_key:"close".into()})},"extend").await.unwrap();
-        assert_eq!(h.observe(&run,|v|v.header.status.is_terminal()).await.header.status,RunStatus::Succeeded);
-        assert_eq!(h.adapter.calls.load(Ordering::SeqCst),1);
-        assert_eq!(h.store.records(&run,RecordFamily::Response,None,100).await.unwrap().len(),1);
-        for usage in h.store.records(&run,RecordFamily::Usage,None,100).await.unwrap(){assert!(matches!(usage.payload,Value::Map(m)if m.get("concurrency_reserved")==Some(&Value::Integer(0))));}
+        let bound = Duration::from_secs(10);
+        tokio::time::timeout(bound, async {
+            while h.adapter.calls.load(Ordering::SeqCst) == 0 {
+                actix::clock::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("MCP call must enter the adapter");
+        let waits = h.store.records(&run, RecordFamily::Wait, None, 100).await.unwrap();
+        let wait = waits.first().expect("planning wait must precede dispatch");
+
+        // Pause the worker after the response is durable, just before it can
+        // release the outstanding reservation.
+        let (recorded, response_ready) = tokio::sync::oneshot::channel();
+        let (resume, account_response) = std::sync::mpsc::channel();
+        *h.policy.on_mcp_policy.lock().unwrap() = Some(Box::new(move || {
+            recorded.send(()).unwrap();
+            account_response.recv_timeout(bound).expect("resume MCP accounting");
+        }));
+        h.adapter.release.store(true, Ordering::SeqCst);
+        tokio::time::timeout(bound, response_ready)
+            .await
+            .expect("worker must reach MCP accounting")
+            .unwrap();
+        let responses = h.store.records(&run, RecordFamily::Response, None, 100).await.unwrap();
+        assert_eq!(responses.len(), 1);
+        let reservation = RecordKey {
+            family: RecordFamily::Reservation,
+            id: responses[0].key.id.clone(),
+        };
+        assert!(!h.store.record(&run, &reservation).await.unwrap().final_record);
+
+        // Wait classification runs after extension accounting has read the
+        // outstanding reservation. Let the worker release it before commit.
+        let store = h.store.clone();
+        let run_to_check = run.clone();
+        *h.policy.on_reply_labels.lock().unwrap() = Some(Box::new(move || {
+            resume.send(()).unwrap();
+            std::thread::spawn(move || {
+                actix::System::new().block_on(async move {
+                    tokio::time::timeout(bound, async {
+                        while !store.record(&run_to_check, &reservation).await.unwrap().final_record {
+                            actix::clock::sleep(Duration::from_millis(2)).await;
+                        }
+                    })
+                    .await
+                    .expect("worker must release the reservation before extension commit");
+                })
+            })
+            .join()
+            .unwrap();
+        }));
+
+        let request = ExtensionRequest {
+            expected_fingerprint: h.fingerprint,
+            composed_fingerprint: composed.fingerprint,
+            inputs: BTreeMap::new(),
+            close_wait: Some(CloseWait {
+                wait_id: wait.key.id.parse().unwrap(),
+                value: Value::Bool(true),
+                idempotency_key: "close".into(),
+            }),
+        };
+        h.runtime.extend_run(&h.caller, &run, &request, "extend").await.unwrap();
+        let view = h.observe(&run, |v| v.header.status.is_terminal()).await;
+        assert_eq!(view.header.status, RunStatus::Succeeded);
+        assert_eq!(view.header.fingerprint, composed.fingerprint);
+        assert_eq!(h.adapter.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(h.store.records(&run, RecordFamily::Response, None, 100).await.unwrap(), responses);
+        for usage in h.store.records(&run, RecordFamily::Usage, None, 100).await.unwrap() {
+            let Value::Map(usage) = usage.payload else { panic!("invalid usage record") };
+            assert_eq!(usage.get("calls_spent"), Some(&Value::Integer(1)));
+            assert_eq!(usage.get("concurrency_reserved"), Some(&Value::Integer(0)));
+        }
         engine.shutdown().await.unwrap();
     });
 }

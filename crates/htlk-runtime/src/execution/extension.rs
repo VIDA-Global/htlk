@@ -10,8 +10,8 @@ use crate::{
     identity::{InvocationId, RunId, ScopeInstanceId, WaitId, host_request_digest},
     records::{InputManifest, InputValue, ManifestEntry, SecurityLabels},
     store::{
-        RecordFamily, RecordWrite, RootReplacement, RunLease, StoredRecord, Transition,
-        TransitionContext,
+        RecordFamily, RecordWrite, RootReplacement, RunHeader, RunLease, StoreError, StoredRecord,
+        Transition, TransitionContext,
     },
 };
 use htlk_analyzer::ScopeUse;
@@ -252,7 +252,29 @@ pub(super) async fn install(
     command: &Command,
     request: &ExtensionRequest,
 ) -> Result<Value, RuntimeError> {
-    let header = runtime.store.run_header(lease.run_id()).await?;
+    let mut header = runtime.store.run_header(lease.run_id()).await?;
+    for _ in 0..8 {
+        match install_at(runtime, lease, command, request, &header).await {
+            Err(RuntimeError::Storage(StoreError::Conflict)) => {
+                let current = runtime.store.run_header(lease.run_id()).await?;
+                if current.sequence == header.sequence {
+                    break;
+                }
+                header = current;
+            }
+            result => return result,
+        }
+    }
+    Err(RuntimeError::failure(FailureCode::ExtensionConflict))
+}
+
+async fn install_at(
+    runtime: &Runtime,
+    lease: &RunLease,
+    command: &Command,
+    request: &ExtensionRequest,
+    header: &RunHeader,
+) -> Result<Value, RuntimeError> {
     if header.status.is_terminal() {
         return Err(invalid());
     }
@@ -654,17 +676,12 @@ pub(super) async fn install(
                 }),
                 expected_fingerprint: Some(request.expected_fingerprint),
             },
-            None,
+            // Usage and outstanding reservations are read separately. An MCP
+            // response can change either before we install the new ancestry.
+            Some(header.sequence),
             artifacts,
         )
-        .await
-        .map_err(|e| {
-            if matches!(e, crate::store::StoreError::Conflict) {
-                RuntimeError::failure(FailureCode::ExtensionConflict)
-            } else {
-                e.into()
-            }
-        })?;
+        .await?;
     Ok(response)
 }
 fn same_entry(a: &ManifestEntry, b: &ManifestEntry) -> bool {
@@ -884,7 +901,7 @@ async fn ancestry_usage(
         .await
     {
         Ok(record) => record.payload,
-        Err(crate::store::StoreError::Missing) => object([
+        Err(StoreError::Missing) => object([
             (
                 "limits",
                 field(&old_scope.payload, "effective_limits")?.clone(),
