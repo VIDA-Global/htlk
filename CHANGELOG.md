@@ -78,6 +78,8 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ### Fixed
 
+- Run extensions retry stale accounting snapshots when an in-flight MCP response
+  releases a reservation, preserving spent calls and atomic wait closure.
 - MCP client shutdown waits for bounded transport cleanup even when a cancelled
   session has already been removed from the session lookup registry.
 - The interactive guide retries transient inspection conflicts while waiting for
