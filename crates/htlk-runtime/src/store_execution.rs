@@ -7,6 +7,12 @@ pub(crate) struct SchedulingPage {
     pub scopes: Vec<StoredRecord>,
 }
 
+pub(crate) struct DueRuns {
+    pub now: i64,
+    pub runs: Vec<RunId>,
+    pub next_eligible: Option<i64>,
+}
+
 impl SqliteStore {
     pub(crate) async fn parked_deadline(&self, run: &RunId) -> Result<Option<i64>, StoreError> {
         let run = run.clone();
@@ -64,7 +70,8 @@ impl SqliteStore {
         observed: i64,
         limit: usize,
         selected: Option<Vec<RunId>>,
-    ) -> Result<(i64, Vec<RunId>), StoreError> {
+        active: Vec<RunId>,
+    ) -> Result<DueRuns, StoreError> {
         let limit = self.page_size(limit)?;
         if selected
             .as_ref()
@@ -73,14 +80,22 @@ impl SqliteStore {
             return Err(StoreError::Invalid);
         }
         if matches!(selected.as_deref(), Some([])) {
-            return Ok((observed, Vec::new()));
+            return Ok(DueRuns {
+                now: observed,
+                runs: Vec::new(),
+                next_eligible: None,
+            });
         }
         let limits = self.config.limits.clone();
         self.connection
             .read(move |db| {
                 let tx = db.transaction_with_behavior(TransactionBehavior::Deferred)?;
                 let now = runs::observed_time(&tx, observed)?;
-                let mut result = Vec::new();
+                let mut result = DueRuns {
+                    now,
+                    runs: Vec::new(),
+                    next_eligible: None,
+                };
                 let mut bytes = 0usize;
                 {
                     let selected: Vec<_> = selected
@@ -89,36 +104,50 @@ impl SqliteStore {
                         .iter()
                         .map(RunId::as_str)
                         .collect();
+                    let active: Vec<_> = active.iter().map(RunId::as_str).collect();
                     let mut sql = String::from(
-                        "SELECT run_id FROM runs WHERE status='running' AND eligible_at_ms<=?1",
+                        "SELECT run_id,eligible_at_ms FROM runs WHERE status='running'",
                     );
-                    let mut parameters: Vec<&dyn rusqlite::ToSql> = vec![&now, &limit];
-                    if !selected.is_empty() {
-                        sql.push_str(" AND (");
-                        for (index, run) in selected.iter().enumerate() {
+                    let mut parameters: Vec<&dyn rusqlite::ToSql> = vec![&limit];
+                    for (predicate, ids) in [
+                        (" AND run_id IN (", &selected),
+                        (" AND run_id NOT IN (", &active),
+                    ] {
+                        if ids.is_empty() {
+                            continue;
+                        }
+                        sql.push_str(predicate);
+                        for (index, run) in ids.iter().enumerate() {
                             use std::fmt::Write;
                             if index > 0 {
-                                sql.push_str(" OR ");
+                                sql.push(',');
                             }
-                            write!(sql, "run_id=?{}", index + 3).expect("string format");
+                            write!(sql, "?{}", parameters.len() + 1).expect("string format");
                             parameters.push(run);
                         }
                         sql.push(')');
                     }
-                    sql.push_str(" ORDER BY eligible_at_ms,run_id LIMIT ?2");
+                    sql.push_str(" ORDER BY eligible_at_ms,run_id LIMIT ?1");
                     let mut statement = tx.prepare(&sql)?;
                     let mut rows = statement.query(parameters.as_slice())?;
                     while let Some(row) = rows.next()? {
+                        let eligible: i64 = row.get(1)?;
+                        if eligible > now {
+                            result.next_eligible = Some(eligible);
+                            break;
+                        }
                         let id = transitions::text(row, 0, &limits)?;
                         bytes = bytes.checked_add(id.len() + 1).ok_or(StoreError::Invalid)?;
                         if bytes > limits.max_document_bytes {
                             break;
                         }
-                        result.push(RunId::new(id, &limits).map_err(|_| StoreError::Corrupt)?);
+                        result
+                            .runs
+                            .push(RunId::new(id, &limits).map_err(|_| StoreError::Corrupt)?);
                     }
                 }
                 tx.commit()?;
-                Ok((now, result))
+                Ok(result)
             })
             .await
             .map_err(StoreError::from_worker)

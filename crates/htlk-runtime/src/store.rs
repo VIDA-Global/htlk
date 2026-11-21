@@ -277,17 +277,17 @@ impl Store {
         now_ms: i64,
         expires_at_ms: i64,
     ) -> Result<RunLease, StoreError> {
-        self.acquire_candidate(run, owner, now_ms, expires_at_ms, false)
+        self.acquire_inner(run, owner, now_ms, expires_at_ms, Acquisition::Authority)
             .await
     }
 
-    pub(crate) async fn acquire_candidate(
+    pub(crate) async fn acquire_inner(
         &self,
         run: &RunId,
         owner: String,
         now_ms: i64,
         expires_at_ms: i64,
-        parked_only: bool,
+        acquisition: Acquisition,
     ) -> Result<RunLease, StoreError> {
         check_lease_times(now_ms, expires_at_ms)?;
         self.check_text(&owner)?;
@@ -297,7 +297,7 @@ impl Store {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let header = load_header(&tx, &run)?;
             if header.status.is_terminal() { return Err(StoreError::Terminal); }
-            if parked_only {
+            if acquisition == Acquisition::Parked {
                 let parked: bool = tx.query_row("SELECT owner IS NULL AND eligible_at_ms>0 FROM runs WHERE run_id=?1", [run.as_str()], |row| row.get(0))?;
                 if !parked { return Err(StoreError::Fenced); }
             }
@@ -306,7 +306,12 @@ impl Store {
             if header.owner.is_some() && header.expires_at_ms.is_some_and(|expiry| expiry > now) { return Err(StoreError::Fenced); }
             let fence = header.fence.checked_add(1).ok_or(StoreError::Invalid)?;
             let sequence = header.sequence.checked_add(1).ok_or(StoreError::Invalid)?;
-            tx.execute("UPDATE runs SET owner=?2,fence=?3,lease_expires_ms=?4,eligible_at_ms=?4,sequence=?5,last_time_ms=?6 WHERE run_id=?1", params![run.as_str(), owner, fence, expires_at_ms, sequence, now])?;
+            let updated = if acquisition == Acquisition::Due {
+                tx.execute("UPDATE runs SET owner=?2,fence=?3,lease_expires_ms=?4,eligible_at_ms=?4,sequence=?5,last_time_ms=?6 WHERE run_id=?1 AND eligible_at_ms<=?6", params![run.as_str(), owner, fence, expires_at_ms, sequence, now])?
+            } else {
+                tx.execute("UPDATE runs SET owner=?2,fence=?3,lease_expires_ms=?4,eligible_at_ms=?4,sequence=?5,last_time_ms=?6 WHERE run_id=?1", params![run.as_str(), owner, fence, expires_at_ms, sequence, now])?
+            };
+            if updated != 1 { return Err(StoreError::Fenced); }
             let payload = lease_payload(&owner, fence, expires_at_ms, &limits)?;
             append_event(&tx, run.as_str(), sequence, EventMeta { kind: "ownership_acquired", actor: &owner, timestamp: now, causation: "ownership", command: None }, &payload, &limits)?;
             tx.commit()?;
@@ -359,6 +364,13 @@ impl Store {
             .text(text, 0)
             .map_err(|_| StoreError::Invalid)
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Acquisition {
+    Authority,
+    Due,
+    Parked,
 }
 
 /// Validated run identity and graph selected by the calling runtime service.

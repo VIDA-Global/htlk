@@ -22,6 +22,8 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ### Changed
 
+- Idle execution discovery uses local wake hints, stored eligibility times and
+  bounded reconciliation on both database backends. Native identities change.
 - Pure batch command receipts are looked up by exact command identity in the
   journal without maintaining a duplicate receipt row.
 - Historical record versions share their rows with inspection feed changes.

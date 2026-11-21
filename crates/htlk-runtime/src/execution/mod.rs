@@ -32,7 +32,7 @@ use crate::{
     Runtime, RuntimeError,
     failure::FailureCode,
     identity::RunId,
-    store::{RunLease, StoreError},
+    store::{Acquisition, RunLease, StoreError},
 };
 use actix::WeakAddr;
 use actix::prelude::*;
@@ -40,7 +40,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Bound,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Host-selected coordination scope, independent of graph authorization.
@@ -67,7 +67,9 @@ pub struct ExecutionConfig {
     pub max_runs: usize,
     /// Ownership lease duration in milliseconds.
     pub lease_ms: i64,
-    /// Scheduling/recovery polling interval.
+    /// Active scheduling and retry interval. Idle discovery uses hints and the
+    /// next known eligibility, with reconciliation at least every 250 ms or this
+    /// interval, whichever is longer.
     pub poll_interval: Duration,
     /// Maximum ready local decisions committed together within a scope.
     /// Includes sibling guards, admission, skips and pure eval completion.
@@ -137,6 +139,9 @@ impl ExecutionEngine {
             active: BTreeMap::new(),
             attached: BTreeSet::new(),
             polling: false,
+            hinted: false,
+            wake: None,
+            next_eligible: None,
             cursor: None,
         }
         .start();
@@ -213,6 +218,9 @@ pub(crate) struct Supervisor {
     active: BTreeMap<RunId, Addr<Coordinator>>,
     attached: BTreeSet<RunId>,
     polling: bool,
+    hinted: bool,
+    wake: Option<SpawnHandle>,
+    next_eligible: Option<Instant>,
     cursor: Option<RunId>,
 }
 impl Actor for Supervisor {
@@ -220,7 +228,6 @@ impl Actor for Supervisor {
     fn started(&mut self, ctx: &mut Self::Context) {
         ctx.set_mailbox_capacity(64);
         ctx.notify(Poll);
-        ctx.run_interval(self.config.poll_interval, |_, ctx| ctx.notify(Poll));
     }
     fn stopped(&mut self, ctx: &mut Self::Context) {
         self.stop.cancel();
@@ -296,13 +303,19 @@ impl Handler<Finished> for Supervisor {
 impl Handler<Poll> for Supervisor {
     type Result = ();
     fn handle(&mut self, _: Poll, ctx: &mut Self::Context) {
-        if self.polling || self.active.len() >= self.config.max_runs {
+        if self.polling {
+            self.hinted = true;
+            return;
+        }
+        if let Some(handle) = self.wake.take() {
+            ctx.cancel_future(handle);
+        }
+        if self.active.len() >= self.config.max_runs {
             return;
         }
         self.polling = true;
         let runtime = self.runtime.clone();
         let cursor = self.cursor.clone();
-        let active = self.active.keys().cloned().collect::<BTreeSet<_>>();
         let room = self
             .config
             .max_runs
@@ -314,34 +327,46 @@ impl Handler<Poll> for Supervisor {
             let after = cursor.as_ref().map_or(Bound::Unbounded, Bound::Excluded);
             self.attached
                 .range((after, Bound::Unbounded))
+                .filter(|run| !self.active.contains_key(*run))
                 .take(room)
                 .cloned()
                 .collect::<Vec<_>>()
         });
+        let active = if attached.is_none() {
+            self.active.keys().cloned().collect()
+        } else {
+            Vec::new()
+        };
         ctx.spawn(
             async move {
                 let observed = runtime.clock.now_ms()?;
-                let (now, runs) = runtime
+                let sample = Instant::now();
+                let due = runtime
                     .store
-                    .due_runs(observed, room, attached.clone())
+                    .due_runs(observed, room, attached.clone(), active)
                     .await?;
+                let next = due.next_eligible.and_then(|at| {
+                    sample.checked_add(Duration::from_millis(at.saturating_sub(due.now) as u64))
+                });
                 let mut ready = Vec::new();
-                for run in &runs {
-                    if active.contains(run) {
-                        continue;
-                    }
+                for run in due.runs {
                     let owner = runtime.store.reserve_run_id().await?;
-                    ready.push((run.clone(), owner.to_string(), now));
+                    ready.push((run, owner.to_string(), due.now));
                 }
-                Ok::<_, RuntimeError>((attached.unwrap_or_default(), ready))
+                Ok::<_, RuntimeError>((attached.unwrap_or_default(), ready, next))
             }
             .into_actor(self)
             .map(move |result, actor, ctx| {
                 actor.polling = false;
-                if let Ok((runs, ready)) = result {
-                    actor.cursor = runs.last().cloned();
-                    if runs.len() < room {
-                        actor.cursor = None
+                let mut delay = actor.config.poll_interval;
+                if let Ok((runs, ready, next)) = result {
+                    actor.cursor = (runs.len() == room).then(|| runs.last().cloned()).flatten();
+                    if let Some(next) = next {
+                        actor.next_eligible =
+                            Some(actor.next_eligible.map_or(next, |old| old.min(next)));
+                    }
+                    if ready.len() < room {
+                        delay = delay.max(Duration::from_millis(250));
                     }
                     for (run, owner, now) in ready {
                         if actor.active.contains_key(&run)
@@ -368,6 +393,23 @@ impl Handler<Poll> for Supervisor {
                         .start();
                         actor.active.insert(run, address);
                     }
+                } else {
+                    actor.cursor = None;
+                }
+                let hinted = std::mem::take(&mut actor.hinted);
+                if actor.active.len() >= actor.config.max_runs {
+                    actor.cursor = None;
+                    actor.next_eligible = None;
+                } else if hinted || actor.cursor.is_some() {
+                    ctx.notify(Poll);
+                } else if actor.config.scope == ExecutionScope::All || !actor.attached.is_empty() {
+                    if let Some(at) = actor.next_eligible.take() {
+                        delay = delay.min(at.saturating_duration_since(Instant::now()));
+                    }
+                    actor.wake = Some(ctx.run_later(delay, |actor, ctx| {
+                        actor.wake = None;
+                        ctx.notify(Poll);
+                    }));
                 }
             }),
         );
@@ -434,24 +476,29 @@ impl Actor for Coordinator {
         let now = self.initial_time;
         let expiry = now.saturating_add(self.config.lease_ms);
         ctx.wait(
-            async move { runtime.store.acquire(&run, owner, now, expiry).await }
-                .into_actor(self)
-                .map(|result, actor, ctx| match result {
-                    Ok(lease) => {
-                        if actor
-                            .runtime
-                            .mcp_control
-                            .execution(&lease, &actor.stop)
-                            .is_err()
-                        {
-                            ctx.stop();
-                            return;
-                        }
-                        actor.state = CoordinationState::Recovering(lease);
-                        ctx.notify(Pulse)
+            async move {
+                runtime
+                    .store
+                    .acquire_inner(&run, owner, now, expiry, Acquisition::Due)
+                    .await
+            }
+            .into_actor(self)
+            .map(|result, actor, ctx| match result {
+                Ok(lease) => {
+                    if actor
+                        .runtime
+                        .mcp_control
+                        .execution(&lease, &actor.stop)
+                        .is_err()
+                    {
+                        ctx.stop();
+                        return;
                     }
-                    Err(_) => ctx.stop(),
-                }),
+                    actor.state = CoordinationState::Recovering(lease);
+                    ctx.notify(Pulse)
+                }
+                Err(_) => ctx.stop(),
+            }),
         );
         ctx.run_interval(self.config.poll_interval, |_, ctx| ctx.notify(Pulse));
     }

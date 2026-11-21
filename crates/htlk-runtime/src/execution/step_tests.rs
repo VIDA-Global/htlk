@@ -52,6 +52,43 @@ impl RuntimePolicy for Policy {
     }
 }
 struct Clock(i64);
+
+#[tokio::test]
+async fn discovery_does_not_reacquire_a_run_reparked_after_the_scan() {
+    use crate::store::{Acquisition, StoreError};
+    let (runtime, _, lease, _) = waiting_run().await;
+    let run = lease.run_id();
+    let sequence = runtime.store.run_header(run).await.unwrap().sequence;
+    let parked = runtime
+        .store
+        .park_run(&lease, 1000, sequence, 1200, false)
+        .await
+        .unwrap();
+    assert!(parked.is_some());
+    let page = runtime.store.due_runs(1000, 1, None, vec![]).await.unwrap();
+    assert!(page.runs.is_empty());
+    assert_eq!(page.next_eligible, Some(1200));
+    assert!(matches!(
+        runtime
+            .store
+            .acquire_inner(run, "stale-scan".into(), 1000, 2000, Acquisition::Due)
+            .await,
+        Err(StoreError::Fenced)
+    ));
+    let page = runtime
+        .store
+        .due_runs(1200, 1, None, vec![run.clone()])
+        .await
+        .unwrap();
+    assert!(page.runs.is_empty());
+    assert!(page.next_eligible.is_none());
+    let acquired = runtime
+        .store
+        .acquire_inner(run, "due".into(), 1200, 2000, Acquisition::Due)
+        .await
+        .unwrap();
+    assert!(acquired.fence() > lease.fence());
+}
 impl CoordinatorClock for Clock {
     fn now_ms(&self) -> Result<i64, RuntimeFailure> {
         Ok(self.0)
