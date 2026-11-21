@@ -126,12 +126,12 @@ pub fn native_profile(
         include_bytes!("store_mcp_url.rs"),
         include_bytes!("store_mcp_url_state.rs"),
         include_bytes!("store_mcp_url.sql"),
-        b"rusqlite=0.41.1;features=bundled,cache,fallible_uint",
+        b"rusqlite=0.43.0;features=bundled,cache,fallible_uint",
         b"postgres=0.19.14;tokio-postgres=0.7.18;postgres-native-tls=0.5.3;native-tls=0.2.18",
     ]);
     let regex = EngineIdentity::new(
         "htlk.native-regex".into(),
-        "1.13.1/automata-0.4.18/syntax-0.8.11/adapter-0.1".into(),
+        "1.13.2/automata-0.4.19/syntax-0.8.12/adapter-0.1".into(),
         "Unicode-16.0.0".into(),
         identity(&[
             include_bytes!("native_profile.rs"),

@@ -46,7 +46,7 @@ of use-site role. Type APIs retain their distinct `TypeContext` requirements.
 ## Canonical CBOR
 
 The public `cbor` module replaces the standalone codec package. Its adapter uses
-pinned **cbor2 1.1.5** header/scalar primitives while retaining HTLK's restricted
+pinned **cbor2 1.2.0** header/scalar primitives while retaining HTLK's restricted
 deterministic profile, resource accounting, fallible allocation and strict ingress.
 It rejects nonminimal encodings, negative zero, nonfinite floats, duplicate or
 out-of-order keys, nontext keys, tags, indefinite lengths and trailing data.

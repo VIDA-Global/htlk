@@ -16,7 +16,7 @@ pub fn implementation_digest() -> Digest {
         include_bytes!("schema_locations.rs"),include_bytes!("schema_resources.rs"),include_bytes!("schema_projection.rs"),
         include_bytes!("schema_inference.rs"),include_bytes!("schema_inference/merge.rs"),include_bytes!("schema_inference/wire.rs"),
         include_bytes!("mcp_protocol.rs"),include_bytes!("../assets/mcp-2025-11-25.schema.json"),
-        b"jsonschema=0.56.0;regex=1.13.1;regex-automata=0.4.18;regex-syntax=0.8.11;iri-string=0.7.14;serde=1.0.229;serde_json=1.0.151",
+        b"jsonschema=0.62.0;regex=1.13.2;regex-automata=0.4.19;regex-syntax=0.8.12;iri-string=0.7.14;serde=1.0.229;serde_json=1.0.154",
     ];
     let mut hash = Sha256::new();
     hash.update(b"htlk.analyzer-implementation/0.1\n");
