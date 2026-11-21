@@ -70,6 +70,8 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ### Fixed
 
+- MCP client shutdown waits for bounded transport cleanup even when a cancelled
+  session has already been removed from the session lookup registry.
 - The interactive guide retries transient inspection conflicts while waiting for
   a run to finish or open a request, instead of failing an otherwise valid lesson.
 - PostgreSQL COMMIT warnings, including cancellation of a synchronous replication

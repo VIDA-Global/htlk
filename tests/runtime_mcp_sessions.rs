@@ -462,7 +462,7 @@ fn cancelling_one_session_keeps_other_runs_live_and_shutdown_is_acknowledged() {
         assert_eq!(methods(&peer, "notifications/cancelled").len(), 1);
         lease.close().await.unwrap();
         adapter.shutdown().await.unwrap();
-        wait_cleanup(&peer, 2).await;
+        assert_eq!(methods(&peer, "session/closed").len(), 2);
         assert!(adapter.connect(&binding, &healthy, &limits).await.is_err());
         adapter.shutdown().await.unwrap();
     });
