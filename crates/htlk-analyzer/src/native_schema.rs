@@ -375,7 +375,7 @@ impl NativeSchemas {
     pub fn identity(limits: &Limits) -> Result<EngineIdentity, MetadataError> {
         EngineIdentity::new(
             "htlk.native-jsonschema".into(),
-            "0.56.0/adapter-0.1".into(),
+            "0.62.0/adapter-0.1".into(),
             "2020-12;format-annotation;ecma-linear".into(),
             crate::implementation_digest(),
             limits,
@@ -588,7 +588,8 @@ fn object_root(
 fn engine_error(error: &jsonschema::ValidationError<'_>) -> Result<(), NativeSchemaError> {
     use jsonschema::error::ValidationErrorKind as K;
     match error.kind() {
-        K::BacktrackLimitExceeded { .. } | K::RegexEngineFailure { .. } | K::Referencing(_) => {
+        // jsonschema 0.62 reports unfinished regex matches through this variant.
+        K::BacktrackLimitExceeded { .. } | K::Referencing(_) => {
             Err(NativeSchemaError::EngineFailure)
         }
         K::AnyOf { context } | K::OneOfMultipleValid { context } | K::OneOfNotValid { context } => {

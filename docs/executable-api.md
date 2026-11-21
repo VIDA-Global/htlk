@@ -613,7 +613,7 @@ presence rules.
 document. `NativeRegistry::verify_profile` compares every core, regex, schema,
 URI-template, and policy identity. `link_policy` selects exact trusted host policies;
 an embedded policy cannot approve its own identity. Adapter identities include implementation source;
-regex 1.13.1, regex-automata 0.4.18, regex-syntax 0.8.11 (Unicode 16.0.0), and
+regex 1.13.2, regex-automata 0.4.19, regex-syntax 0.8.12 (Unicode 16.0.0), and
 iri-string 0.7.14 are pinned in the published dependency constraints. The native
 schema resource contract remains unchanged. `verify_executable` composes profile
 admission and registry-backed execution with schema/MCP and whole-graph verification.
@@ -1572,7 +1572,7 @@ authorization, delivery/retry decisions, and service drift remain runtime work.
 ### Native schema validation
 
 `NativeSchemas::compile(&SchemaCatalog, NativeSchemaOptions, &Limits)` compiles the
-supplied catalog with the shipped native Rust `jsonschema` 0.56.0 dependency. Its
+supplied catalog with the shipped native Rust `jsonschema` 0.62.0 dependency. Its
 HTTP/file retrieval features are disabled, and both registry preparation and
 validator construction use an offline retriever. Each required retrieval root is
 compiled explicitly; compilation failures are propagated.

@@ -22,6 +22,8 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ### Changed
 
+- Refresh the Cargo dependencies, including the pinned native engines. Native
+  implementation identities and executable fingerprints change.
 - Idle execution discovery uses local wake hints, stored eligibility times and
   bounded reconciliation on both database backends. Native identities change.
 - Active execution uses independent deadline and lease timers, reuses deadline

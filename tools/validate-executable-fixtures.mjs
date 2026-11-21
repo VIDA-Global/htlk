@@ -122,7 +122,7 @@ const model = implementation('htlk.model-implementation/0.1\n', [
     'cbor/mod.rs', 'cbor/accounting.rs', 'cbor/decode.rs', 'cbor/encode.rs',
     'cbor/error.rs', 'cbor/limits.rs', 'cbor/value.rs',
   ]),
-  Buffer.from('cbor2=1.1.5;half=2.7.1;ryu-js=1.0.3;serde_json=1.0.151;url=2.5.8;sha2=0.10.9'),
+  Buffer.from('cbor2=1.2.0;half=2.7.1;ryu-js=1.0.3;serde_json=1.0.154;url=2.5.9;sha2=0.11.1'),
 ]);
 const analyzer = implementation('htlk.analyzer-implementation/0.1\n', [
   rawDigest(model),
@@ -134,7 +134,7 @@ const analyzer = implementation('htlk.analyzer-implementation/0.1\n', [
     'schema_inference.rs', 'schema_inference/merge.rs', 'schema_inference/wire.rs', 'mcp_protocol.rs',
     '../assets/mcp-2025-11-25.schema.json',
   ]),
-  Buffer.from('jsonschema=0.56.0;regex=1.13.1;regex-automata=0.4.18;regex-syntax=0.8.11;iri-string=0.7.14;serde=1.0.229;serde_json=1.0.151'),
+  Buffer.from('jsonschema=0.62.0;regex=1.13.2;regex-automata=0.4.19;regex-syntax=0.8.12;iri-string=0.7.14;serde=1.0.229;serde_json=1.0.154'),
 ]);
 const native = parts => implementation('htlk.native-implementation/0.1\n', parts);
 assert.equal(get(profile, 'core_digest').value, native([
@@ -157,7 +157,7 @@ assert.equal(get(profile, 'core_digest').value, native([
     'store_mcp_subscriptions.rs', 'store_mcp_subscriptions.sql',
     'store_mcp_url.rs', 'store_mcp_url_state.rs', 'store_mcp_url.sql',
   ]),
-  Buffer.from('rusqlite=0.41.1;features=bundled,cache,fallible_uint'),
+  Buffer.from('rusqlite=0.43.0;features=bundled,cache,fallible_uint'),
   Buffer.from('postgres=0.19.14;tokio-postgres=0.7.18;postgres-native-tls=0.5.3;native-tls=0.2.18'),
 ]));
 assert.equal(get(get(profile, 'regex_engine'), 'implementation_digest').value,

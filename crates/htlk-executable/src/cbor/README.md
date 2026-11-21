@@ -154,7 +154,7 @@ same ceiling. Changes to either traversal require rerunning these regressions.
 
 ### Float conversion
 
-Binary16/32 conversion and preferred float serialization use `cbor2` 1.1.5
+Binary16/32 conversion and preferred float serialization use `cbor2` 1.2.0
 (MIT), with default features disabled. A narrower float is selected only when
 the conversion is lossless. Tests independently calculate all finite binary16
 patterns and cover binary32/binary64 precision boundaries and subnormals.
