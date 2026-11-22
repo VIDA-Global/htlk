@@ -23,6 +23,13 @@ pub fn native_compiler_with_timeouts(
     )
 }
 pub fn native_compiler_with_defaults(defaults: ExecutionLimits) -> (Compiler, NativeRegistry) {
+    native_compiler_with_value_limit(defaults, 65_536)
+}
+
+pub fn native_compiler_with_value_limit(
+    defaults: ExecutionLimits,
+    max_value_bytes: u64,
+) -> (Compiler, NativeRegistry) {
     let limits = Limits::default();
     let policy = PolicyDocument::new(
         PolicyFields {
@@ -30,12 +37,16 @@ pub fn native_compiler_with_defaults(defaults: ExecutionLimits) -> (Compiler, Na
             defaults,
             evaluator_limits: EvaluatorLimits {
                 max_expression_depth: 64,
-                max_value_bytes: 65536,
+                max_value_bytes,
                 max_collection_visits: 10000,
                 max_regex_bytes: 4096,
                 max_regex_compiled_bytes: 65536,
                 max_output_bytes: 65536,
-                max_steps: 100000,
+                max_steps: if max_value_bytes == 65_536 {
+                    100_000
+                } else {
+                    max_value_bytes * 2
+                },
             },
             maximum_scope_depth: 32,
             maximum_expanded_nodes: 1000,

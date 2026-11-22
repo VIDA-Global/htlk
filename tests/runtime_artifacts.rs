@@ -5,6 +5,11 @@ use htlk::runtime::{
     artifact::{ArtifactInput, ArtifactMetadata, ArtifactProducer, PreparedArtifact},
     failure::{FailureCode, RuntimeFailure},
     identity::{RunId, ScopeInstanceId},
+    inspection::{
+        ContentKind, DiscoveryTarget, EntityId, InspectionContext, InspectionError,
+        InspectionPolicy, InspectionTarget, Inspector, OriginalArtifactResult, RunSelector,
+        UnavailableReason,
+    },
     records::SecurityLabels,
     store::{
         RecordFamily, RecordKey, RecordWrite, RunLease, RunSeed, StoreConfig, Transition,
@@ -12,7 +17,7 @@ use htlk::runtime::{
     },
 };
 use htlk_executable::{
-    Identifier, ValueType,
+    ExecutionLimits, Identifier, ValueType,
     cbor::{self, Limits, Map, Value},
     digest::{Digest, hash_bytes},
 };
@@ -51,6 +56,18 @@ impl RuntimePolicy for Policy {
         Ok(SecurityLabels::default())
     }
 }
+
+impl InspectionPolicy for Policy {
+    fn discover(&self, context: &InspectionContext, _: &DiscoveryTarget<'_>) -> bool {
+        context.host().principal() == "reader"
+    }
+    fn structure(&self, _: &InspectionContext, _: &InspectionTarget<'_>) -> bool {
+        true
+    }
+    fn content(&self, _: &InspectionContext, _: &InspectionTarget<'_>, _: ContentKind) -> bool {
+        self.read.load(Ordering::SeqCst)
+    }
+}
 struct Fixture {
     runtime: Runtime,
     store: SqliteStore,
@@ -62,6 +79,12 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let (compiler, registry) = native_compiler();
+        Self::with_compiler(compiler, registry).await
+    }
+    async fn with_compiler(
+        compiler: htlk::compiler::Compiler,
+        registry: htlk::runtime::NativeRegistry,
+    ) -> Self {
         let output=compiler.compile_source(r#"ir_version="0.1" graph test.artifacts{
           inputs={native=optional(string),json=optional(json),blob=optional(bytes)} outputs={native=optional(string),json=optional(json),blob=optional(bytes)} nodes{}
           edges{edge native{from=inputs.native to=outputs.native} edge json{from=inputs.json to=outputs.json} edge blob{from=inputs.blob to=outputs.blob}}
@@ -175,6 +198,79 @@ impl Fixture {
 }
 fn context(name: &str) -> HostContext {
     HostContext::new(name.into(), &Limits::default()).unwrap()
+}
+
+#[test]
+fn original_artifact_returns_exact_stored_bytes_beyond_metadata_limit() {
+    actix::System::new().block_on(async {
+        let defaults = ExecutionLimits::new()
+            .with_timeout_ms(1000)
+            .unwrap()
+            .with_attempt_timeout_ms(100)
+            .unwrap()
+            .with_max_concurrency(1)
+            .unwrap();
+        let (compiler, registry) =
+            support::native_compiler_with_value_limit(defaults, 2 * 1024 * 1024);
+        let f = Fixture::with_compiler(compiler, registry).await;
+        let value = Value::Bytes(vec![0xa3; 1_250_000]);
+        let proposal = f.prepare("blob", &value);
+        let id = proposal.metadata().artifact_id();
+        f.store.stage_artifact(&proposal).await.unwrap();
+        f.accept(&proposal, "accept-original").await;
+        let inspector = Inspector::new(f.store.clone().into(), f.policy.clone());
+        let caller = InspectionContext::new(context("reader"), None);
+        let pinned = inspector
+            .open_snapshot(&caller, RunSelector::Id(f.run.clone()), None)
+            .await
+            .unwrap();
+        let selected = inspector
+            .select(
+                &caller,
+                &pinned,
+                EntityId::Record(RecordKey {
+                    family: RecordFamily::Artifact,
+                    id: id.to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        let reference = &selected.reference;
+        assert!(matches!(
+            inspector
+                .read_original_artifact(&caller, &pinned, reference, 1_048_576)
+                .await
+                .unwrap(),
+            OriginalArtifactResult::Unavailable(UnavailableReason::TooLarge)
+        ));
+        let OriginalArtifactResult::Available(original) = inspector
+            .read_original_artifact(&caller, &pinned, reference, 1_300_000)
+            .await
+            .unwrap()
+        else {
+            panic!("original unavailable")
+        };
+        assert_eq!(
+            original.bytes(),
+            cbor::encode(&value, &Limits::default()).unwrap()
+        );
+        assert_eq!(
+            hash_bytes(original.bytes()),
+            proposal.metadata().storage_reference()
+        );
+        assert_eq!(
+            original.protection.artifact.as_ref(),
+            Some(proposal.metadata())
+        );
+        f.policy.read.store(false, Ordering::SeqCst);
+        assert_eq!(
+            inspector
+                .read_original_artifact(&caller, &pinned, reference, 1_300_000)
+                .await
+                .unwrap_err(),
+            InspectionError::Denied
+        );
+    });
 }
 
 #[test]

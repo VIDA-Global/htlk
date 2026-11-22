@@ -510,6 +510,40 @@ pub struct ProtectedContent {
     pub protection: Protection,
 }
 
+/// Selected original canonical bytes and the unchanged accepted protection.
+#[derive(Clone)]
+pub struct OriginalArtifact {
+    bytes: Vec<u8>,
+    /// Accepted source metadata and conservative read protection.
+    pub protection: Protection,
+}
+
+impl OriginalArtifact {
+    /// Exact, verified store bytes; no re-encoding of the selected value.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl fmt::Debug for OriginalArtifact {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OriginalArtifact")
+            .field("byte_length", &self.bytes.len())
+            .field("bytes", &"[redacted]")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Outcome of an authorized exact byte selection, independent of the bounded
+/// decoded-inspection view.
+#[derive(Clone, Debug)]
+pub enum OriginalArtifactResult {
+    /// Complete original canonical value bytes.
+    Available(Box<OriginalArtifact>),
+    /// Authorized selection whose original bytes cannot presently be returned.
+    Unavailable(UnavailableReason),
+}
+
 /// Inspection failures contain no protected payloads or database diagnostics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InspectionError {
@@ -952,6 +986,79 @@ impl Inspector {
             value,
             protection: selected.protection,
         })))
+    }
+
+    /// Read the exact stored canonical bytes for one accepted artifact. An
+    /// authorized snapshot/reference selects identity and provenance; the
+    /// current store checks expiry, retention and the byte bound before loading
+    /// its original. The selected format's full codec limit applies rather than
+    /// the independently bounded decoded inspection view's 1 MiB ceiling.
+    ///
+    /// # Errors
+    /// Returns denial, unknown/invalid identity, invalid bounds, corrupt data,
+    /// or a backend failure. A snapshot never grants authority or pins bytes.
+    pub async fn read_original_artifact(
+        &self,
+        context: &InspectionContext,
+        snapshot: &Snapshot,
+        reference: &Reference,
+        max_bytes: usize,
+    ) -> Result<OriginalArtifactResult> {
+        if max_bytes == 0 || max_bytes > self.limits().max_document_bytes {
+            return Err(InspectionError::InvalidRequest);
+        }
+        self.check_reference(context, snapshot, reference).await?;
+        self.check_discovery(context, snapshot, reference)?;
+        let selected = self.load(snapshot, reference).await?;
+        let target = selected.target(snapshot, reference);
+        self.check_discovery(context, snapshot, reference)?;
+        if !self
+            .policy
+            .content(context, &target, ContentKind::ArtifactValue)
+        {
+            return Err(InspectionError::Denied);
+        }
+        let metadata = selected
+            .protection
+            .artifact
+            .as_ref()
+            .ok_or(InspectionError::InvalidRequest)?;
+        let bytes = match self
+            .store
+            .artifact_bytes_limited(
+                metadata.artifact_id(),
+                metadata.storage_reference(),
+                max_bytes,
+            )
+            .await
+        {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                return Ok(OriginalArtifactResult::Unavailable(
+                    UnavailableReason::TooLarge,
+                ));
+            }
+            Err(StoreError::Expired) => {
+                return Ok(OriginalArtifactResult::Unavailable(
+                    UnavailableReason::Expired,
+                ));
+            }
+            Err(StoreError::Missing) => {
+                return Ok(OriginalArtifactResult::Unavailable(
+                    UnavailableReason::NotRetained,
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        metadata
+            .verify_value(&bytes, self.limits())
+            .map_err(|_| InspectionError::Corrupt)?;
+        Ok(OriginalArtifactResult::Available(Box::new(
+            OriginalArtifact {
+                bytes,
+                protection: selected.protection,
+            },
+        )))
     }
 
     /// Page structural event summaries at the exact snapshot journal bound. Raw

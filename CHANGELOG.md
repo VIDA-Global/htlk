@@ -8,6 +8,10 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ### Added
 
+- Engine-free authorized original artifact export returns the exact native stored
+  canonical bytes, with the full codec byte limit and current retention checks.
+- This changes the native implementation profile; retain the original profile
+  for existing executable reproduction and verification.
 - Hosts can freeze an absolute run admission deadline and reconcile an original
   admission receipt without creating work.
 - Authorized successor hosts can submit a durably saved MCP response for the
