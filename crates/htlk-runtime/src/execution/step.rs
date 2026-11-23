@@ -349,6 +349,18 @@ async fn commit_with_blobs(
     status: Option<RunStatus>,
     blobs: Vec<PreparedArtifact>,
 ) -> Result<(), RuntimeError> {
+    // A reply already received is evidence, not admission of new work. Its
+    // protected storage must remain possible after the active grant ends.
+    let evidence_only = status.is_none()
+        && writes
+            .iter()
+            .any(|w| w.key.family == RecordFamily::Response)
+        && writes
+            .iter()
+            .all(|w| matches!(w.key.family, RecordFamily::Response | RecordFamily::Attempt));
+    if !evidence_only {
+        super::remaining_processing_ms()?;
+    }
     let now = runtime.clock.now_ms()?;
     let transition = Transition {
         context: TransitionContext {

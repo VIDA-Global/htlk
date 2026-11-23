@@ -397,6 +397,7 @@ pub struct Runtime {
     pub(crate) execution: Mutex<Option<actix::WeakAddr<crate::execution::Supervisor>>>,
     pub(crate) mcp: Option<Arc<dyn crate::mcp::McpAdapter>>,
     pub(crate) mcp_control: crate::mcp_control::McpControl,
+    pub(crate) processing: Option<Arc<dyn crate::execution::ProcessingBudget>>,
     // Rebuildable scheduler observation: valid only at this exact journal sequence
     // and before the earliest timer. Never serialized or used to execute work.
     pub(crate) quiescent: Mutex<BTreeMap<crate::identity::RunId, (i64, i64)>>,
@@ -442,6 +443,7 @@ impl Runtime {
             execution: Mutex::new(None),
             mcp: None,
             mcp_control: Default::default(),
+            processing: None,
             quiescent: Mutex::new(BTreeMap::new()),
         })
     }
@@ -460,6 +462,16 @@ impl Runtime {
     /// documents. Endpoints, credentials and replay policy remain host facts.
     pub fn with_mcp(mut self, adapter: Arc<dyn crate::mcp::McpAdapter>) -> Self {
         self.mcp = Some(adapter);
+        self
+    }
+
+    /// Installs the trusted owner's durable active-processing meter before
+    /// launching the engine. This does not replace native absolute deadlines.
+    pub fn with_processing_budget(
+        mut self,
+        budget: Arc<dyn crate::execution::ProcessingBudget>,
+    ) -> Self {
+        self.processing = Some(budget);
         self
     }
     /// Independently verifies authoritative envelope bytes, authorizes registration

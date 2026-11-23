@@ -59,22 +59,37 @@ async fn setup() -> (
     RunId,
     SqliteStore,
 ) {
+    setup_with_budget(None).await
+}
+
+async fn setup_with_budget(
+    budget: Option<Arc<dyn htlk::runtime::execution::ProcessingBudget>>,
+) -> (
+    Arc<Runtime>,
+    ExecutionEngine,
+    Arc<Clock>,
+    RunId,
+    SqliteStore,
+) {
     let (compiler, registry) = native_compiler();
     let result=compiler.compile_source(r#"ir_version="0.1" graph test.wait{inputs={request=json} outputs={value=string}nodes{review=wait(string){topic="review" timeout_ms=500}}edges{edge request{from=inputs.request to=review.inputs.request} edge reply{from=review.outputs.value to=outputs.value}}}"#,&catalogs()).unwrap();
     let clock = Arc::new(Clock(AtomicI64::new(1000)));
     let store = SqliteStore::in_memory(StoreConfig::default())
         .await
         .unwrap();
-    let runtime = Arc::new(
-        Runtime::new(
-            store.clone(),
-            Arc::new(registry),
-            Arc::new(Policy),
-            RuntimeConfig::default(),
-        )
-        .unwrap()
-        .with_clock(clock.clone()),
-    );
+    let runtime = Runtime::new(
+        store.clone(),
+        Arc::new(registry),
+        Arc::new(Policy),
+        RuntimeConfig::default(),
+    )
+    .unwrap()
+    .with_clock(clock.clone());
+    let runtime = Arc::new(if let Some(budget) = budget {
+        runtime.with_processing_budget(budget)
+    } else {
+        runtime
+    });
     runtime
         .register_graph(&context("alice"), &result.executable_bytes, &[])
         .await
@@ -102,6 +117,76 @@ async fn setup() -> (
         .unwrap()
         .run_id;
     (runtime, engine, clock, run, store)
+}
+
+#[actix::test]
+async fn parked_run_holds_no_active_grant_and_budget_stops_the_next_work() {
+    use htlk::runtime::{
+        execution::{ProcessingBudget, ProcessingGrant},
+        mcp::McpFuture,
+        store::RunLease,
+    };
+    use std::sync::atomic::AtomicBool;
+    #[derive(Default)]
+    struct Meter {
+        issued: AtomicI64,
+        settled: AtomicI64,
+        exhausted: AtomicBool,
+    }
+    impl ProcessingBudget for Meter {
+        fn reserve<'a>(&'a self, _: &'a RunLease) -> McpFuture<'a, Option<ProcessingGrant>> {
+            Box::pin(async move {
+                Ok(if self.exhausted.load(Ordering::SeqCst) {
+                    None
+                } else {
+                    Some(ProcessingGrant {
+                        id: self.issued.fetch_add(1, Ordering::SeqCst),
+                        allowance: Duration::from_secs(5),
+                    })
+                })
+            })
+        }
+        fn settle<'a>(
+            &'a self,
+            _: &'a RunLease,
+            grant: ProcessingGrant,
+            _: Duration,
+        ) -> McpFuture<'a, ()> {
+            Box::pin(async move {
+                assert_eq!(self.settled.fetch_add(1, Ordering::SeqCst), grant.id);
+                Ok(())
+            })
+        }
+    }
+    let meter = Arc::new(Meter::default());
+    let (runtime, engine, _, run, store) = setup_with_budget(Some(meter.clone())).await;
+    let wait = open(&runtime, &run).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while store.run_header(&run).await.unwrap().owner.is_some() {
+            actix::clock::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let count = meter.issued.load(Ordering::SeqCst);
+    assert!(count > 0);
+    actix::clock::sleep(Duration::from_millis(300)).await;
+    assert_eq!(count, meter.issued.load(Ordering::SeqCst));
+    assert_eq!(count, meter.settled.load(Ordering::SeqCst));
+    meter.exhausted.store(true, Ordering::SeqCst);
+    runtime
+        .submit_reply(
+            &context("alice"),
+            wait,
+            Value::Text("answer".into()),
+            "meter-resume",
+        )
+        .await
+        .unwrap();
+    assert_eq!(terminal(&runtime, &run).await, RunStatus::Failed);
+    let view = runtime.inspect_run(&context("alice"), &run).await.unwrap();
+    assert_eq!(view.failure.unwrap().code(), FailureCode::Budget);
+    engine.shutdown().await.unwrap();
 }
 async fn open(runtime: &Runtime, run: &RunId) -> htlk::runtime::identity::WaitId {
     for _ in 0..1000 {

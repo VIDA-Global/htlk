@@ -740,6 +740,8 @@ async fn operate_inner(
         // flight. Persist the response against its own authoritative attempt, not
         // the scheduling snapshot that preceded dispatch.
         super::working::with(|set| set.reset(0));
+        let timeout =
+            super::remaining_processing_ms()?.map_or(timeout, |remaining| remaining.min(timeout));
         let outcome = match bounded(
             &cancellation.token,
             timeout,

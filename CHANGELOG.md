@@ -6,6 +6,10 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ## [Unreleased]
 
+- Native execution can use a trusted host's durable active-processing grants.
+  Work reserves a grant before it starts, reports monotonic elapsed time, and
+  preserves received provider evidence after a grant closes.
+
 ### Added
 
 - Engine-free authorized original artifact export returns the exact native stored

@@ -54,6 +54,51 @@ pub enum ExecutionScope {
     Attached,
 }
 
+/// Trusted, durable accounting for the active work of a native coordinator.
+/// A grant is reserved before work; an interrupted settlement never refunds it.
+pub trait ProcessingBudget: Send + Sync {
+    /// Reserve one grant under the exact native execution fence. `None` means
+    /// the known budget is exhausted. Storage ambiguity must return an error.
+    fn reserve<'a>(
+        &'a self,
+        lease: &'a RunLease,
+    ) -> crate::mcp::McpFuture<'a, Option<ProcessingGrant>>;
+    /// Settle the original grant after work returns. Time is monotonic and may
+    /// exceed the grant while a task is being stopped or reclaimed.
+    fn settle<'a>(
+        &'a self,
+        lease: &'a RunLease,
+        grant: ProcessingGrant,
+        elapsed: Duration,
+    ) -> crate::mcp::McpFuture<'a, ()>;
+}
+
+/// A durable reservation and the maximum active duration it authorizes.
+#[derive(Clone, Copy, Debug)]
+pub struct ProcessingGrant {
+    /// Host-owned opaque reservation identity.
+    pub id: i64,
+    /// Positive time allowance reserved by the host.
+    pub allowance: Duration,
+}
+
+tokio::task_local! { static PROCESSING_DEADLINE: Instant; }
+
+pub(super) fn remaining_processing_ms() -> Result<Option<u64>, RuntimeError> {
+    PROCESSING_DEADLINE
+        .try_with(|deadline| {
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis();
+            if remaining == 0 {
+                Err(RuntimeError::failure(FailureCode::Budget))
+            } else {
+                Ok(Some(u64::try_from(remaining).unwrap_or(u64::MAX)))
+            }
+        })
+        .unwrap_or(Ok(None))
+}
+
 /// Finite worker, mailbox, ownership and polling settings.
 #[derive(Clone, Debug)]
 pub struct ExecutionConfig {
@@ -114,6 +159,7 @@ impl ExecutionEngine {
             || config.poll_interval.is_zero()
             || config.poll_interval > Duration::from_secs(10)
             || !(1..=8).contains(&config.pure_batch_steps)
+            || runtime.processing.is_some() && config.pure_batch_steps != 1
         {
             return Err(RuntimeError::failure(FailureCode::Profile));
         }
@@ -200,7 +246,7 @@ impl Handler<Work> for Worker {
         let cell = std::cell::RefCell::new(msg.working);
         let mut run = Box::pin(working::WORKING.scope(
             cell,
-            recovery::drive(msg.runtime, msg.lease, msg.recovering, msg.pure_batch_steps),
+            drive_work(msg.runtime, msg.lease, msg.recovering, msg.pure_batch_steps),
         ));
         let result = System::new().block_on(run.as_mut());
         let cache = run
@@ -208,6 +254,59 @@ impl Handler<Work> for Worker {
             .take_value()
             .and_then(std::cell::RefCell::into_inner);
         MessageResult((result, cache))
+    }
+}
+
+async fn drive_work(
+    runtime: Arc<Runtime>,
+    lease: RunLease,
+    recovering: bool,
+    batch: usize,
+) -> Result<step::Progress, RuntimeError> {
+    let Some(meter) = runtime.processing.as_ref() else {
+        return recovery::drive(runtime, lease, recovering, batch).await;
+    };
+    let grant = meter.reserve(&lease).await?;
+    let Some(grant) = grant else {
+        control::stop(
+            &runtime,
+            &lease,
+            None,
+            None,
+            FailureCode::Budget,
+            false,
+            vec![],
+        )
+        .await?;
+        return Ok(step::Progress::Terminal);
+    };
+    let started = Instant::now();
+    let deadline = started
+        .checked_add(grant.allowance)
+        .filter(|deadline| *deadline > started)
+        .ok_or_else(|| RuntimeError::failure(FailureCode::Profile))?;
+    let result = PROCESSING_DEADLINE
+        .scope(
+            deadline,
+            recovery::drive(runtime.clone(), lease.clone(), recovering, batch),
+        )
+        .await;
+    meter.settle(&lease, grant, started.elapsed()).await?;
+    match result {
+        Err(error) if error.code() == FailureCode::Budget => {
+            control::stop(
+                &runtime,
+                &lease,
+                None,
+                None,
+                FailureCode::Budget,
+                false,
+                vec![],
+            )
+            .await?;
+            Ok(step::Progress::Terminal)
+        }
+        result => result,
     }
 }
 pub(crate) struct Supervisor {
