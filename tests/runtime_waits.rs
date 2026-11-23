@@ -205,6 +205,19 @@ fn reply_type_policy_and_idempotency_are_checked_without_holding_workers() {
     actix::System::new().block_on(async {
         let (runtime, engine, clock, run, store) = setup().await;
         let wait = open(&runtime, &run).await;
+        assert!(
+            runtime
+                .reconcile_reply(
+                    &context("alice"),
+                    wait,
+                    Value::Text("answer".into()),
+                    "reply"
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(open(&runtime, &run).await, wait);
         assert_eq!(
             runtime
                 .submit_reply(&context("bob"), wait, Value::Text("answer".into()), "reply")
@@ -239,6 +252,54 @@ fn reply_type_policy_and_idempotency_are_checked_without_holding_workers() {
         assert_eq!(terminal(&runtime, &run).await, RunStatus::Succeeded);
         engine.shutdown().await.unwrap();
         let before = store.run_header(&run).await.unwrap();
+        assert_eq!(
+            runtime
+                .reconcile_reply(
+                    &context("alice"),
+                    wait,
+                    Value::Text("answer".into()),
+                    "reply"
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .disposition,
+            "accepted"
+        );
+        assert!(
+            runtime
+                .reconcile_reply(
+                    &context("alice"),
+                    wait,
+                    Value::Text("answer".into()),
+                    "other-key"
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            runtime
+                .reconcile_reply(
+                    &context("alice"),
+                    wait,
+                    Value::Text("changed".into()),
+                    "reply"
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            FailureCode::IdempotencyConflict
+        );
+        assert_eq!(
+            runtime
+                .reconcile_reply(&context("bob"), wait, Value::Text("answer".into()), "reply")
+                .await
+                .unwrap_err()
+                .code(),
+            FailureCode::Policy
+        );
+        assert_eq!(store.run_header(&run).await.unwrap(), before);
         let receipt = runtime
             .cancel_run(&context("alice"), &run, "already complete", "terminal-noop")
             .await

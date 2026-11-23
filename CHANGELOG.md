@@ -14,6 +14,8 @@ User-visible changes and compatibility boundaries are recorded here, following
   for existing executable reproduction and verification.
 - Hosts can freeze an absolute run admission deadline and reconcile an original
   admission receipt without creating work.
+- Authorized hosts can reconcile the retained exact reply or approval receipt
+  after an ambiguous handoff without submitting or waking native work.
 - Authorized successor hosts can submit a durably saved MCP response for the
   original graph attempt under a current fence, without another provider call.
 - Opt-in bounded pure-eval batching. Logical decisions remain in the journal;

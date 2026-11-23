@@ -504,6 +504,8 @@ fn approval_generations_are_authenticated_and_old_allow_cannot_authorize_new_req
             .await
             .unwrap();
         let request = pending_approval(&runtime, &caller, &denied.run_id, None).await;
+        let original_action = request.request_digest.unwrap();
+        assert!(runtime.reconcile_approval(&approver, request.wait_id, original_action, false, "deny").await.unwrap().is_none());
         assert!(
             runtime
                 .submit_approval(&approver, request.wait_id, digest, true, "wrong-request")
@@ -527,6 +529,11 @@ fn approval_generations_are_authenticated_and_old_allow_cannot_authorize_new_req
                 .status,
             RunStatus::Failed
         );
+        assert_eq!(script.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.reconcile_approval(&approver, request.wait_id, original_action, false, "deny").await.unwrap().unwrap().disposition,"deny");
+        assert!(runtime.reconcile_approval(&approver, request.wait_id, original_action, false, "other-key").await.unwrap().is_none());
+        assert!(runtime.reconcile_approval(&approver, request.wait_id, original_action, true, "deny").await.is_err());
+        assert!(runtime.reconcile_approval(&caller, request.wait_id, original_action, false, "deny").await.is_err());
         assert_eq!(script.calls.load(Ordering::SeqCst), 1);
         assert!(
             runtime

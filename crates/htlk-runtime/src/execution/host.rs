@@ -263,6 +263,61 @@ pub(super) async fn route(runtime: &Runtime, command: Command) -> Result<Value, 
     first
 }
 impl Runtime {
+    /// Looks up the committed receipt for the exact original approval under
+    /// current authority. An accepted wait alone does not prove this key won.
+    /// `None` means no retained receipt; this method never submits work.
+    ///
+    /// # Errors
+    /// Returns authority, purpose, action, key conflict or storage errors.
+    pub async fn reconcile_approval(
+        &self,
+        context: &HostContext,
+        wait_id: WaitId,
+        request_digest: Digest,
+        allow: bool,
+        idempotency_key: &str,
+    ) -> Result<Option<ReplyReceipt>, RuntimeError> {
+        let (command, _) = self
+            .approval_command(context, wait_id, request_digest, allow, idempotency_key)
+            .await?;
+        self.wait_receipt(wait_id, &command).await
+    }
+
+    /// Looks up the committed receipt for the exact original typed reply under
+    /// current authority. `None` does not establish that the reply was unsent.
+    /// This method neither attaches an engine nor submits work.
+    ///
+    /// # Errors
+    /// Returns authority, purpose, key conflict or storage errors.
+    pub async fn reconcile_reply(
+        &self,
+        context: &HostContext,
+        wait_id: WaitId,
+        value: Value,
+        idempotency_key: &str,
+    ) -> Result<Option<ReplyReceipt>, RuntimeError> {
+        let (command, _) = self
+            .reply_command(context, wait_id, value, idempotency_key)
+            .await?;
+        self.wait_receipt(wait_id, &command).await
+    }
+
+    async fn wait_receipt(
+        &self,
+        wait_id: WaitId,
+        command: &Command,
+    ) -> Result<Option<ReplyReceipt>, RuntimeError> {
+        recorded(self, command)
+            .await?
+            .map(|response| {
+                Ok(ReplyReceipt {
+                    wait_id,
+                    disposition: string(&response, "disposition")?,
+                })
+            })
+            .transpose()
+    }
+
     /// Resolves exact-action policy approval. Ordinary replies cannot call this
     /// disposition path or produce a graph-visible authority Boolean.
     ///
@@ -276,6 +331,44 @@ impl Runtime {
         allow: bool,
         idempotency_key: &str,
     ) -> Result<ReplyReceipt, RuntimeError> {
+        let (command, wait) = self
+            .approval_command(context, wait_id, request_digest, allow, idempotency_key)
+            .await?;
+        if let Some(previous) = self.wait_receipt(wait_id, &command).await? {
+            return Ok(previous);
+        }
+        let state = string(&wait.payload, "state")?;
+        if state == "accepted" {
+            let decision = if allow { "allow" } else { "deny" };
+            if string(&wait.payload, "decision")? != decision {
+                return Err(RuntimeError::failure(FailureCode::IdempotencyConflict));
+            }
+            return Ok(ReplyReceipt {
+                wait_id,
+                disposition: decision.into(),
+            });
+        }
+        if state != "open"
+            || self.store.coordinator_time(self.clock.now_ms()?).await?
+                >= number(&wait.payload, "expires_at")?
+        {
+            return Err(RuntimeError::failure(FailureCode::ApprovalDenied));
+        }
+        let response = route(self, command).await?;
+        Ok(ReplyReceipt {
+            wait_id,
+            disposition: string(&response, "disposition")?,
+        })
+    }
+
+    async fn approval_command(
+        &self,
+        context: &HostContext,
+        wait_id: WaitId,
+        request_digest: Digest,
+        allow: bool,
+        idempotency_key: &str,
+    ) -> Result<(Command, crate::store::StoredRecord), RuntimeError> {
         let (run, wait) = self
             .store
             .find_record(RecordFamily::Wait, &wait_id.to_string())
@@ -315,34 +408,7 @@ impl Runtime {
                 allow,
             },
         };
-        if let Some(response) = recorded(self, &command).await? {
-            return Ok(ReplyReceipt {
-                wait_id,
-                disposition: string(&response, "disposition")?,
-            });
-        }
-        let state = string(&wait.payload, "state")?;
-        if state == "accepted" {
-            let decision = if allow { "allow" } else { "deny" };
-            if string(&wait.payload, "decision")? != decision {
-                return Err(RuntimeError::failure(FailureCode::IdempotencyConflict));
-            }
-            return Ok(ReplyReceipt {
-                wait_id,
-                disposition: decision.into(),
-            });
-        }
-        if state != "open"
-            || self.store.coordinator_time(self.clock.now_ms()?).await?
-                >= number(&wait.payload, "expires_at")?
-        {
-            return Err(RuntimeError::failure(FailureCode::ApprovalDenied));
-        }
-        let response = route(self, command).await?;
-        Ok(ReplyReceipt {
-            wait_id,
-            disposition: string(&response, "disposition")?,
-        })
+        Ok((command, wait))
     }
     /// Submits an authenticated typed reply to an explicit input wait. Exact-action
     /// approval waits are resolved only by the separate approval API.
@@ -356,42 +422,11 @@ impl Runtime {
         value: Value,
         idempotency_key: &str,
     ) -> Result<ReplyReceipt, RuntimeError> {
-        let (run, wait) = self
-            .store
-            .find_record(RecordFamily::Wait, &wait_id.to_string())
+        let (command, wait) = self
+            .reply_command(context, wait_id, value, idempotency_key)
             .await?;
-        if string(&wait.payload, "purpose")? != "input" {
-            return Err(RuntimeError::failure(FailureCode::Policy));
-        }
-        authorize_reply(self, context, &run, &wait, wait_id).await?;
-        if idempotency_key.is_empty() {
-            return Err(RuntimeError::failure(FailureCode::Input));
-        }
-        let digest = host_request_digest(
-            context.principal(),
-            "submit_reply",
-            &wait_id.to_string(),
-            &value,
-            &self.config.limits,
-        )
-        .map_err(|_| RuntimeError::failure(FailureCode::Input))?;
-        let command = Command {
-            run,
-            context: context.clone(),
-            method: "submit_reply".into(),
-            target: wait_id.to_string(),
-            key: idempotency_key.into(),
-            digest,
-            operation: Operation::Reply {
-                wait: wait_id,
-                value,
-            },
-        };
-        if let Some(response) = recorded(self, &command).await? {
-            return Ok(ReplyReceipt {
-                wait_id,
-                disposition: string(&response, "disposition")?,
-            });
+        if let Some(previous) = self.wait_receipt(wait_id, &command).await? {
+            return Ok(previous);
         }
         if string(&wait.payload, "state")? == "accepted" {
             let Operation::Reply { value, .. } = &command.operation else {
@@ -432,6 +467,47 @@ impl Runtime {
             wait_id,
             disposition: string(&response, "disposition")?,
         })
+    }
+
+    async fn reply_command(
+        &self,
+        context: &HostContext,
+        wait_id: WaitId,
+        value: Value,
+        idempotency_key: &str,
+    ) -> Result<(Command, crate::store::StoredRecord), RuntimeError> {
+        let (run, wait) = self
+            .store
+            .find_record(RecordFamily::Wait, &wait_id.to_string())
+            .await?;
+        if string(&wait.payload, "purpose")? != "input" {
+            return Err(RuntimeError::failure(FailureCode::Policy));
+        }
+        authorize_reply(self, context, &run, &wait, wait_id).await?;
+        if idempotency_key.is_empty() {
+            return Err(RuntimeError::failure(FailureCode::Input));
+        }
+        let digest = host_request_digest(
+            context.principal(),
+            "submit_reply",
+            &wait_id.to_string(),
+            &value,
+            &self.config.limits,
+        )
+        .map_err(|_| RuntimeError::failure(FailureCode::Input))?;
+        let command = Command {
+            run,
+            context: context.clone(),
+            method: "submit_reply".into(),
+            target: wait_id.to_string(),
+            key: idempotency_key.into(),
+            digest,
+            operation: Operation::Reply {
+                wait: wait_id,
+                value,
+            },
+        };
+        Ok((command, wait))
     }
     /// Cancels future work/acceptance through the current fenced owner. Cancellation
     /// does not undo already sent effects or replace committed terminal outcomes.
