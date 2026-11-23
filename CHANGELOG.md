@@ -12,6 +12,8 @@ User-visible changes and compatibility boundaries are recorded here, following
 
 ### Added
 
+- `ExecutionEngine::shutdown_and_confirm` waits for local coordination and
+  calculation work to relinquish resources; transport and store closure are separate.
 - Engine-free authorized original artifact export returns the exact native stored
   canonical bytes, with the full codec byte limit and current retention checks.
 - This changes the native implementation profile; retain the original profile

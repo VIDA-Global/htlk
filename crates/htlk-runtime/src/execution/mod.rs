@@ -139,6 +139,7 @@ impl Default for ExecutionConfig {
 #[derive(Clone)]
 pub struct ExecutionEngine {
     address: Addr<Supervisor>,
+    stopped: tokio::sync::watch::Receiver<()>,
 }
 impl ExecutionEngine {
     /// Starts supervision inside the application's Actix system. Source admission
@@ -176,7 +177,12 @@ impl ExecutionEngine {
         {
             return Err(RuntimeError::failure(FailureCode::Profile));
         }
-        let workers = SyncArbiter::start(config.workers, || Worker);
+        let (lifetime, stopped) = tokio::sync::watch::channel(());
+        let worker_lifetime = lifetime.clone();
+        // SyncArbiter retains a clone of the factory in every native thread.
+        let workers = SyncArbiter::start(config.workers, move || Worker {
+            _lifetime: worker_lifetime.clone(),
+        });
         let address = Supervisor {
             stop: Arc::new(crate::mcp::McpCancellation::new()),
             runtime: runtime.clone(),
@@ -189,10 +195,11 @@ impl ExecutionEngine {
             wake: None,
             next_eligible: None,
             cursor: None,
+            lifetime,
         }
         .start();
         *execution = Some(address.downgrade());
-        Ok(Self { address })
+        Ok(Self { address, stopped })
     }
 
     /// Select an existing run for this engine's lifetime. Repetition is idempotent;
@@ -221,8 +228,20 @@ impl ExecutionEngine {
             .await
             .map_err(|_| RuntimeError::failure(FailureCode::Invariant))
     }
+
+    /// Stops local supervision and waits until the coordinators and native
+    /// calculation workers have relinquished their resources. A caller can
+    /// time out this wait, but a timeout is not a shutdown confirmation.
+    /// Transport-owner and store lifetimes must still be closed separately.
+    pub async fn shutdown_and_confirm(&self) {
+        let _ = self.shutdown().await;
+        // No values are published; the channel closing is the witness.
+        let _ = self.stopped.clone().changed().await;
+    }
 }
-struct Worker;
+struct Worker {
+    _lifetime: tokio::sync::watch::Sender<()>,
+}
 impl Actor for Worker {
     type Context = SyncContext<Self>;
 }
@@ -321,6 +340,7 @@ pub(crate) struct Supervisor {
     wake: Option<SpawnHandle>,
     next_eligible: Option<Instant>,
     cursor: Option<RunId>,
+    lifetime: tokio::sync::watch::Sender<()>,
 }
 impl Actor for Supervisor {
     type Context = Context<Self>;
@@ -474,6 +494,7 @@ impl Handler<Poll> for Supervisor {
                             continue;
                         }
                         let address = Coordinator {
+                            _lifetime: actor.lifetime.clone(),
                             stop: Arc::new(crate::mcp::McpCancellation::linked(&actor.stop)),
                             runtime: actor.runtime.clone(),
                             config: actor.config.clone(),
@@ -549,6 +570,7 @@ struct Coordinator {
     deadline_wake: Option<(Instant, SpawnHandle)>,
     deadline_hint: Option<i64>,
     working: working::Slot,
+    _lifetime: tokio::sync::watch::Sender<()>,
 }
 
 impl Coordinator {

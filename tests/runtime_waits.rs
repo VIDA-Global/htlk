@@ -188,6 +188,61 @@ async fn parked_run_holds_no_active_grant_and_budget_stops_the_next_work() {
     assert_eq!(view.failure.unwrap().code(), FailureCode::Budget);
     engine.shutdown().await.unwrap();
 }
+#[actix::test]
+async fn shutdown_confirmation_waits_for_a_blocked_calculation_worker() {
+    use htlk::runtime::{
+        execution::{ProcessingBudget, ProcessingGrant},
+        mcp::McpFuture,
+        store::RunLease,
+    };
+    #[derive(Default)]
+    struct Meter {
+        blocked: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    impl ProcessingBudget for Meter {
+        fn reserve<'a>(&'a self, _: &'a RunLease) -> McpFuture<'a, Option<ProcessingGrant>> {
+            Box::pin(async {
+                Ok(Some(ProcessingGrant {
+                    id: 1,
+                    allowance: Duration::from_secs(5),
+                }))
+            })
+        }
+        fn settle<'a>(
+            &'a self,
+            _: &'a RunLease,
+            _: ProcessingGrant,
+            _: Duration,
+        ) -> McpFuture<'a, ()> {
+            Box::pin(async move {
+                self.blocked.notify_one();
+                self.release.notified().await;
+                Ok(())
+            })
+        }
+    }
+    let meter = Arc::new(Meter::default());
+    let (_, engine, _, _, store) = setup_with_budget(Some(meter.clone())).await;
+    tokio::time::timeout(Duration::from_secs(5), meter.blocked.notified())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), engine.shutdown_and_confirm())
+            .await
+            .is_err()
+    );
+    meter.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), engine.shutdown_and_confirm())
+        .await
+        .unwrap();
+    store.close().await.unwrap();
+}
+
 async fn open(runtime: &Runtime, run: &RunId) -> htlk::runtime::identity::WaitId {
     for _ in 0..1000 {
         let view = runtime.inspect_run(&context("alice"), run).await.unwrap();
